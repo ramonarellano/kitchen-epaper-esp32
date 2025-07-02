@@ -4,34 +4,30 @@
 #define UART_BAUD 115200
 #define UART_TX_PIN 1
 #define UART_RX_PIN 3
-#define IMAGE_SIZE (800 * 480 / 8)  // 1bpp 800x480
+#define IMAGE_WIDTH 800
+#define IMAGE_HEIGHT 480
+#define IMAGE_BPP 3  // 3 bits per pixel for 7-color e-Paper
+#include "ImageData.h"
+#define image_buffer Image7color
+#undef IMAGE_SIZE
+#define IMAGE_SIZE 192000  // 192,000 bytes for 800x480 (Waveshare)
 
 // Handshake pins for Serial1
 #define SERIAL1_RX 16
 #define SERIAL1_TX 17
 
-// 2x2 checkerboard pattern for 1bpp 800x480
-uint8_t image_buffer[IMAGE_SIZE];
-
-void fill_checkerboard() {
-  // Each byte is 8 pixels, so for 800 pixels per row, 100 bytes per row
-  // 2x2 checkerboard: alternate every 2 rows and every 2 columns
-  for (int y = 0; y < 480; y++) {
-    for (int x_byte = 0; x_byte < 100; x_byte++) {
-      uint8_t pattern = 0;
-      for (int bit = 0; bit < 8; bit++) {
-        int x = x_byte * 8 + bit;
-        bool is_white = (((x / 2) + (y / 2)) % 2) == 0;
-        pattern |= (is_white ? 1 : 0) << (7 - bit);
-      }
-      image_buffer[y * 100 + x_byte] = pattern;
-    }
-  }
-}
+// 7-color e-Paper color codes (3 bits per pixel)
+#define EPD_BLACK 0b000
+#define EPD_WHITE 0b001
+#define EPD_GREEN 0b010
+#define EPD_BLUE 0b011
+#define EPD_RED 0b100
+#define EPD_YELLOW 0b101
+#define EPD_ORANGE 0b110
+#define EPD_UNUSED 0b111
 
 unsigned long lastBlink = 0;
 bool ledState = false;
-bool handshake_complete = false;
 
 void setup() {
   Serial.begin(UART_BAUD);  // USB serial for debug
@@ -40,42 +36,9 @@ void setup() {
     delay(10);
   }
   pinMode(LED_BUILTIN, OUTPUT);
-  fill_checkerboard();
-
-  // Initialize Serial1 for RP2040 handshake
+  // Initialize Serial1 for RP2040 UART
   Serial1.begin(UART_BAUD, SERIAL_8N1, SERIAL1_RX, SERIAL1_TX);
-  while (!handshake_complete) {
-    Serial.println("Waiting for handshake…");
-    unsigned long start = millis();
-    String incoming = "";
-    while (millis() - start < 2000) {
-      while (Serial1.available()) {
-        char c = Serial1.read();
-        Serial.print("Serial1 got: ");
-        Serial.print((int)c);  // Print ASCII code
-        Serial.print(" ('");
-        Serial.print(c);
-        Serial.println("')");
-        incoming += c;
-        // More robust: match with or without newline
-        if (incoming.indexOf("HELLO ESP32") != -1) {
-          Serial.print("Received: ");
-          Serial.println(incoming);
-          Serial.println("Sending reply…");
-          Serial1.println("HELLO RP2040");
-          Serial.println("Handshake complete");
-          handshake_complete = true;
-          break;
-        }
-      }
-      if (handshake_complete)
-        break;
-      delay(10);
-    }
-    if (!handshake_complete) {
-      Serial.println("Handshake timeout, retrying...");
-    }
-  }
+  Serial.println("ESP32 ready for stateless SENDIMG protocol");
 }
 
 void blink_slow() {
@@ -97,29 +60,44 @@ void blink_fast(unsigned long duration_ms) {
   }
 }
 
-void loop() {
-  if (!handshake_complete) {
-    // Optionally, retry handshake here if desired
-    return;
+#define CHUNK_SIZE 1024  // 1KB per chunk, adjust as needed
+
+void send_image_in_chunks(HardwareSerial& port, size_t total_size) {
+  size_t sent = 0;
+  size_t chunk_num = 0;
+  Serial.println("Starting image transfer...");
+  while (sent < total_size) {
+    size_t to_send =
+        (total_size - sent > CHUNK_SIZE) ? CHUNK_SIZE : (total_size - sent);
+    port.write(image_buffer + sent, to_send);
+    sent += to_send;
+    chunk_num++;
+    delay(10);  // Small delay to allow receiver to process
   }
+  Serial.println("All chunks sent.");
+}
+
+void loop() {
   // Listen for image request from RP2040 on Serial1
   if (Serial1.available()) {
     String cmd = Serial1.readStringUntil('\n');
-    cmd.trim();
-    if (cmd == "SENDIMG") {
+    cmd += '\n';  // Ensure newline is included for exact match
+    if (cmd == "SENDIMG\n") {
+      Serial.println("SENDIMG command received on Serial1");
       blink_fast(600);  // Rapid blink for 600ms while sending
-      Serial1.write(image_buffer, IMAGE_SIZE);
-      Serial.println("Image sent to RP2040 on Serial1");
+      send_image_in_chunks(Serial1, IMAGE_SIZE);
+      Serial.println("Image sent to RP2040 on Serial1 (chunked)");
     }
   }
   // Optionally, still allow USB serial monitor commands
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-    if (cmd == "SENDIMG") {
+    cmd += '\n';
+    if (cmd == "SENDIMG\n") {
+      Serial.println("SENDIMG command received on USB serial");
       blink_fast(600);
-      Serial.write(image_buffer, IMAGE_SIZE);
-      Serial.println("Image sent to USB serial");
+      send_image_in_chunks(Serial, IMAGE_SIZE);
+      Serial.println("Image sent to USB serial (chunked)");
     }
   }
   blink_slow();
