@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <WiFi.h>
 
 #define LED_BUILTIN 2  // On most ESP32 boards, GPIO2 is the onboard LED
 #define UART_BAUD 115200
@@ -26,8 +27,32 @@
 #define EPD_ORANGE 0b110
 #define EPD_UNUSED 0b111
 
+// WiFi credentials (replace with your actual SSID and password)
+const char* WIFI_SSID = "arelor";
+const char* WIFI_PASS = "brumlurentser";
+
 unsigned long lastBlink = 0;
 bool ledState = false;
+
+void connect_wifi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 60) {  // 30s timeout
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi connection failed!");
+  }
+}
 
 void setup() {
   Serial.begin(UART_BAUD);  // USB serial for debug
@@ -39,6 +64,7 @@ void setup() {
   // Initialize Serial1 for RP2040 UART
   Serial1.begin(UART_BAUD, SERIAL_8N1, SERIAL1_RX, SERIAL1_TX);
   Serial.println("ESP32 ready for stateless SENDIMG protocol");
+  connect_wifi();
 }
 
 void blink_slow() {
