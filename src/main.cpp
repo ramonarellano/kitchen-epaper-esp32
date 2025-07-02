@@ -1,5 +1,7 @@
 #include <Arduino.h>
+#include <HTTPClient.h>
 #include <WiFi.h>
+#include <esp_heap_caps.h>
 
 #define LED_BUILTIN 2  // On most ESP32 boards, GPIO2 is the onboard LED
 #define UART_BAUD 115200
@@ -8,10 +10,9 @@
 #define IMAGE_WIDTH 800
 #define IMAGE_HEIGHT 480
 #define IMAGE_BPP 3  // 3 bits per pixel for 7-color e-Paper
-#include "ImageData.h"
-#define image_buffer Image7color
 #undef IMAGE_SIZE
-#define IMAGE_SIZE 192000  // 192,000 bytes for 800x480 (Waveshare)
+#define IMAGE_SIZE 192000         // 192,000 bytes for 800x480 (Waveshare)
+uint8_t* image_buffer = nullptr;  // Will be allocated in PSRAM
 
 // Handshake pins for Serial1
 #define SERIAL1_RX 16
@@ -54,6 +55,54 @@ void connect_wifi() {
   }
 }
 
+// Download image from the internet and fill image_buffer
+bool download_image_to_buffer(const char* url) {
+  if (!image_buffer) {
+    Serial.println("Image buffer not allocated!");
+    return false;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, cannot download image.");
+    return false;
+  }
+  HTTPClient http;
+  Serial.print("Downloading image: ");
+  Serial.println(url);
+  http.begin(url);
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.print("HTTP GET failed, code: ");
+    Serial.println(httpCode);
+    http.end();
+    return false;
+  }
+  WiFiClient* stream = http.getStreamPtr();
+  size_t received = 0;
+  while (http.connected() && received < IMAGE_SIZE) {
+    if (stream->available()) {
+      int c = stream->read();
+      if (c < 0)
+        break;
+      image_buffer[received++] = (uint8_t)c;
+      if (received % 4096 == 0) {
+        Serial.printf("Downloaded %u/%u bytes\n", (unsigned)received,
+                      (unsigned)IMAGE_SIZE);
+      }
+    } else {
+      delay(1);
+    }
+  }
+  http.end();
+  if (received == IMAGE_SIZE) {
+    Serial.println("Image download complete!");
+    return true;
+  } else {
+    Serial.printf("Image download incomplete: %u/%u bytes\n",
+                  (unsigned)received, (unsigned)IMAGE_SIZE);
+    return false;
+  }
+}
+
 void setup() {
   Serial.begin(UART_BAUD);  // USB serial for debug
   // Wait for serial connection
@@ -65,6 +114,8 @@ void setup() {
   Serial1.begin(UART_BAUD, SERIAL_8N1, SERIAL1_RX, SERIAL1_TX);
   Serial.println("ESP32 ready for stateless SENDIMG protocol");
   connect_wifi();
+  // Download test image at startup (optional, can be removed if not needed)
+  // download_image_to_buffer("https://drive.google.com/uc?export=download&id=1vwwSW9DbbUZ_H7Q_CaS0rMNKG6HDWAHh");
 }
 
 void blink_slow() {
@@ -88,20 +139,104 @@ void blink_fast(unsigned long duration_ms) {
 
 #define CHUNK_SIZE 1024  // 1KB per chunk, adjust as needed
 
-void send_image_in_chunks(HardwareSerial& port, size_t total_size) {
-  size_t sent = 0;
-  size_t chunk_num = 0;
-  Serial.println("Starting image transfer...");
-  while (sent < total_size) {
-    size_t to_send =
-        (total_size - sent > CHUNK_SIZE) ? CHUNK_SIZE : (total_size - sent);
-    port.write(image_buffer + sent, to_send);
-    sent += to_send;
-    chunk_num++;
-    delay(10);  // Small delay to allow receiver to process
+// Stream image from HTTP directly to UART
+bool stream_image_to_uart(const char* url, HardwareSerial& port) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, cannot stream image.");
+    return false;
   }
-  Serial.println("All chunks sent.");
+  String currentUrl = url;
+  int redirectCount = 0;
+  const int maxRedirects = 3;
+  HTTPClient http;
+  int httpCode = 0;
+  while (redirectCount < maxRedirects) {
+    http.setTimeout(30000);  // 30s timeout for large images
+    http.begin(currentUrl);
+    httpCode = http.GET();
+    Serial.printf("HTTP GET %s -> code: %d\n", currentUrl.c_str(), httpCode);
+    // Print HTTP headers for diagnostics
+    int numHeaders = http.headers();
+    for (int i = 0; i < numHeaders; ++i) {
+      Serial.printf("Header[%d]: %s: %s\n", i, http.headerName(i).c_str(),
+                    http.header(i).c_str());
+    }
+    if (httpCode >= 300 && httpCode < 400) {
+      String location = http.header("Location");
+      Serial.print("Redirected to: ");
+      Serial.println(location);
+      http.end();
+      if (location.length() == 0) {
+        Serial.println("Redirect with no Location header!");
+        return false;
+      }
+      currentUrl = location;
+      redirectCount++;
+      continue;
+    } else {
+      break;
+    }
+  }
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.print("HTTP GET failed, code: ");
+    Serial.println(httpCode);
+    http.end();
+    return false;
+  }
+  WiFiClient* stream = http.getStreamPtr();
+  uint8_t chunk[CHUNK_SIZE];
+  size_t received = 0;
+  unsigned long lastData = millis();
+  const unsigned long readTimeout = 10000;  // 10s timeout for stalled reads
+  int zeroReadCount = 0;
+  const int maxZeroReads = 100;  // Allow up to 100 consecutive zero-byte reads
+  while (http.connected() && received < IMAGE_SIZE) {
+    size_t to_read = (IMAGE_SIZE - received > CHUNK_SIZE)
+                         ? CHUNK_SIZE
+                         : (IMAGE_SIZE - received);
+    int n = stream->readBytes(chunk, to_read);
+    Serial.printf("readBytes returned %d (requested %u) at %u/%u bytes\n", n,
+                  (unsigned)to_read, (unsigned)received, (unsigned)IMAGE_SIZE);
+    if (n > 0) {
+      port.write(chunk, n);
+      received += n;
+      lastData = millis();
+      zeroReadCount = 0;
+      if (received % (CHUNK_SIZE * 4) == 0) {
+        Serial.printf("Streamed %u/%u bytes\n", (unsigned)received,
+                      (unsigned)IMAGE_SIZE);
+      }
+    } else {
+      if (stream->available() == 0) {
+        zeroReadCount++;
+        if (zeroReadCount > maxZeroReads) {
+          Serial.println(
+              "No more data from stream (max zero reads reached), breaking "
+              "loop.");
+          break;
+        }
+      } else {
+        zeroReadCount = 0;
+      }
+      if (millis() - lastData > readTimeout) {
+        Serial.println("Read timeout: no data received for 10s");
+        break;
+      }
+      delay(10);
+    }
+  }
+  http.end();
+  if (received == IMAGE_SIZE) {
+    Serial.println("Image streaming complete!");
+    return true;
+  } else {
+    Serial.printf("Image streaming incomplete: %u/%u bytes\n",
+                  (unsigned)received, (unsigned)IMAGE_SIZE);
+    return false;
+  }
 }
+
+unsigned long lastStatusLog = 0;
 
 void loop() {
   // Listen for image request from RP2040 on Serial1
@@ -111,8 +246,17 @@ void loop() {
     if (cmd == "SENDIMG\n") {
       Serial.println("SENDIMG command received on Serial1");
       blink_fast(600);  // Rapid blink for 600ms while sending
-      send_image_in_chunks(Serial1, IMAGE_SIZE);
-      Serial.println("Image sent to RP2040 on Serial1 (chunked)");
+      bool ok = stream_image_to_uart(
+          "https://raw.githubusercontent.com/ramonarellano/emilies-wishlist/"
+          "main/test_image.bmp",
+          Serial1);
+      if (ok) {
+        Serial.println("Image streamed to RP2040 on Serial1");
+      } else {
+        Serial.println(
+            "ERROR: Image streaming to RP2040 failed. Waiting for next "
+            "request.");
+      }
     }
   }
   // Optionally, still allow USB serial monitor commands
@@ -122,9 +266,24 @@ void loop() {
     if (cmd == "SENDIMG\n") {
       Serial.println("SENDIMG command received on USB serial");
       blink_fast(600);
-      send_image_in_chunks(Serial, IMAGE_SIZE);
-      Serial.println("Image sent to USB serial (chunked)");
+      bool ok = stream_image_to_uart(
+          "https://raw.githubusercontent.com/ramonarellano/emilies-wishlist/"
+          "main/test_image.bmp",
+          Serial);
+      if (ok) {
+        Serial.println("Image streamed to USB serial");
+      } else {
+        Serial.println(
+            "ERROR: Image streaming to USB serial failed. Waiting for next "
+            "request.");
+      }
     }
+  }
+  // Status log every 5 seconds
+  unsigned long now = millis();
+  if (now - lastStatusLog >= 5000) {
+    Serial.println("Waiting for SENDIMG request on Serial1 or USB serial...");
+    lastStatusLog = now;
   }
   blink_slow();
   delay(10);
