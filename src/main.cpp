@@ -102,13 +102,24 @@ void loop() {
     // Optionally, retry handshake here if desired
     return;
   }
+  // Listen for image request from RP2040 on Serial1
+  if (Serial1.available()) {
+    String cmd = Serial1.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "SENDIMG") {
+      blink_fast(600);  // Rapid blink for 600ms while sending
+      Serial1.write(image_buffer, IMAGE_SIZE);
+      Serial.println("Image sent to RP2040 on Serial1");
+    }
+  }
+  // Optionally, still allow USB serial monitor commands
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
     if (cmd == "SENDIMG") {
-      blink_fast(600);  // Rapid blink for 600ms while sending
+      blink_fast(600);
       Serial.write(image_buffer, IMAGE_SIZE);
-      return;
+      Serial.println("Image sent to USB serial");
     }
   }
   blink_slow();
