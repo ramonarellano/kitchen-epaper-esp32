@@ -38,6 +38,34 @@ This is a PlatformIO project for the NodeMCU-32S (ESP32) board. It implements a 
 - USB Serial (Serial): 115200 baud (for debug and `SENDIMG` command)
 - Serial1 (GPIO16/17): 115200 baud (for handshake with RP2040)
 
+## WiFi Credentials Setup
+
+WiFi credentials are **not hardcoded** in the firmware. Instead, they are loaded at runtime from a `.env` file stored in SPIFFS. This allows you to keep your credentials private and out of version control.
+
+### How to set up WiFi credentials
+
+1. Create a file named `.env` in the `/data` directory (see `.env.example` for the format):
+
+   ```ini
+   WIFI_SSID=your_wifi_ssid
+   WIFI_PASS=your_wifi_password
+   ```
+
+2. Upload the `/data/.env` file to the ESP32's SPIFFS filesystem:
+
+   - Build the SPIFFS image:
+     ```sh
+     pio run --target buildfs
+     ```
+   - Upload the SPIFFS image to the device:
+     ```sh
+     platformio run --target uploadfs
+     ```
+
+3. The firmware will automatically read the WiFi credentials from `/data/.env` on boot.
+
+> **Note:** `.env` and `/data/.env` are included in `.gitignore` and will not be committed to version control.
+
 ---
 
 For more details, see the PlatformIO and Arduino documentation.
