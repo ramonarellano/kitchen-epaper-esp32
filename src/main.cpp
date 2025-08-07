@@ -1,7 +1,11 @@
 #include <Arduino.h>
+#include <FS.h>
 #include <HTTPClient.h>
+#include <SPIFFS.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>
+#include "env.h"
 
 #define LED_BUILTIN 2  // On most ESP32 boards, GPIO2 is the onboard LED
 #define UART_BAUD 115200
@@ -28,18 +32,49 @@ uint8_t* image_buffer = nullptr;  // Will be allocated in PSRAM
 #define EPD_ORANGE 0b110
 #define EPD_UNUSED 0b111
 
-// WiFi credentials (replace with your actual SSID and password)
-const char* WIFI_SSID = "arelor";
-const char* WIFI_PASS = "brumlurentser";
-
 unsigned long lastBlink = 0;
 bool ledState = false;
 
+String getEnvVar(const char* filename, const char* key) {
+  File f = SPIFFS.open(filename, "r");
+  if (!f)
+    return String("");
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("#") || line.startsWith(";"))
+      continue;
+    int eq = line.indexOf('=');
+    if (eq > 0) {
+      String k = line.substring(0, eq);
+      String v = line.substring(eq + 1);
+      k.trim();
+      v.trim();
+      if (k == key) {
+        f.close();
+        return v;
+      }
+    }
+  }
+  f.close();
+  return String("");
+}
+
 void connect_wifi() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed!");
+    return;
+  }
+  String ssid = getEnvVar("/.env", "WIFI_SSID");
+  String pass = getEnvVar("/.env", "WIFI_PASS");
+  if (ssid == "" || pass == "") {
+    Serial.println("WiFi credentials not found in /.env!");
+    return;
+  }
   Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
+  Serial.println(ssid);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(ssid.c_str(), pass.c_str());
   int retries = 0;
   while (WiFi.status() != WL_CONNECTED && retries < 60) {  // 30s timeout
     delay(500);
@@ -151,7 +186,8 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
   HTTPClient http;
   int httpCode = 0;
   while (redirectCount < maxRedirects) {
-    http.setTimeout(30000);  // 30s timeout for large images
+    http.setTimeout(60000);  // 60s timeout for large images
+    http.setUserAgent("ESP32/1.0");
     http.begin(currentUrl);
     httpCode = http.GET();
     Serial.printf("HTTP GET %s -> code: %d\n", currentUrl.c_str(), httpCode);
@@ -180,6 +216,9 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
   if (httpCode != HTTP_CODE_OK) {
     Serial.print("HTTP GET failed, code: ");
     Serial.println(httpCode);
+    String payload = http.getString();
+    Serial.print("HTTP error payload: ");
+    Serial.println(payload);
     http.end();
     return false;
   }
@@ -187,7 +226,7 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
   uint8_t chunk[CHUNK_SIZE];
   size_t received = 0;
   unsigned long lastData = millis();
-  const unsigned long readTimeout = 10000;  // 10s timeout for stalled reads
+  const unsigned long readTimeout = 30000;  // 30s timeout for stalled reads
   int zeroReadCount = 0;
   const int maxZeroReads = 100;  // Allow up to 100 consecutive zero-byte reads
   while (http.connected() && received < IMAGE_SIZE) {
@@ -245,10 +284,12 @@ void loop() {
     cmd += '\n';  // Ensure newline is included for exact match
     if (cmd == "SENDIMG\n") {
       Serial.println("SENDIMG command received on Serial1");
+      Serial1.print("ACK\n");
+      Serial.println("ACK sent to RP2040");
       blink_fast(600);  // Rapid blink for 600ms while sending
       bool ok = stream_image_to_uart(
-          "https://raw.githubusercontent.com/ramonarellano/emilies-wishlist/"
-          "main/test_image.bmp",
+          "https://europe-north1-kitche-epaper-renderer.cloudfunctions.net/"
+          "epaper?format=raw",
           Serial1);
       if (ok) {
         Serial.println("Image streamed to RP2040 on Serial1");
@@ -259,30 +300,10 @@ void loop() {
       }
     }
   }
-  // Optionally, still allow USB serial monitor commands
-  if (Serial.available()) {
-    String cmd = Serial.readStringUntil('\n');
-    cmd += '\n';
-    if (cmd == "SENDIMG\n") {
-      Serial.println("SENDIMG command received on USB serial");
-      blink_fast(600);
-      bool ok = stream_image_to_uart(
-          "https://raw.githubusercontent.com/ramonarellano/emilies-wishlist/"
-          "main/test_image.bmp",
-          Serial);
-      if (ok) {
-        Serial.println("Image streamed to USB serial");
-      } else {
-        Serial.println(
-            "ERROR: Image streaming to USB serial failed. Waiting for next "
-            "request.");
-      }
-    }
-  }
   // Status log every 5 seconds
   unsigned long now = millis();
   if (now - lastStatusLog >= 5000) {
-    Serial.println("Waiting for SENDIMG request on Serial1 or USB serial...");
+    Serial.println("Waiting for SENDIMG request on Serial1...");
     lastStatusLog = now;
   }
   blink_slow();
