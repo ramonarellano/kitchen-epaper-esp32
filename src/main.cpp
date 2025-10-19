@@ -10,29 +10,34 @@
 
 // ---------------------- Configuration / Constants ----------------------
 // Hardware
-static const int LED_GPIO = 2;            // On most ESP32 boards, GPIO2 is the onboard LED
-static const int SERIAL1_RX_PIN = 16;     // UART RX for Serial1 (RP2040 -> ESP32)
-static const int SERIAL1_TX_PIN = 17;     // UART TX for Serial1 (ESP32 -> RP2040)
-static const int UART_BAUD_RATE = 115200; // Standard UART baud used
+static const int LED_GPIO =
+    2;  // On most ESP32 boards, GPIO2 is the onboard LED
+static const int SERIAL1_RX_PIN = 16;  // UART RX for Serial1 (RP2040 -> ESP32)
+static const int SERIAL1_TX_PIN = 17;  // UART TX for Serial1 (ESP32 -> RP2040)
+static const int UART_BAUD_RATE = 115200;  // Standard UART baud used
 
 // Image characteristics
 static const uint32_t IMAGE_WIDTH = 800;
 static const uint32_t IMAGE_HEIGHT = 480;
-static const uint32_t IMAGE_BPP = 3;                 // 3 bits per pixel for 7-color e-Paper
-static const uint32_t IMAGE_SIZE = 192000;           // 192,000 bytes for 800x480 (Waveshare)
+static const uint32_t IMAGE_BPP = 3;  // 3 bits per pixel for 7-color e-Paper
+static const uint32_t IMAGE_SIZE =
+    192000;  // 192,000 bytes for 800x480 (Waveshare)
 
 // Networking / HTTP
-static const char IMAGE_URL[] = "https://europe-north1-kitche-epaper-renderer.cloudfunctions.net/epaper?format=raw";
-static const uint32_t HTTP_TIMEOUT_MS = 60000;       // 60s HTTP timeout
+static const char IMAGE_URL[] =
+    "https://europe-north1-kitche-epaper-renderer.cloudfunctions.net/"
+    "epaper?format=raw";
+static const uint32_t HTTP_TIMEOUT_MS = 60000;  // 60s HTTP timeout
 
 // Timeouts and retries
-static const uint32_t WIFI_CONNECT_RETRIES = 60;     // 60 * 0.5s = 30s
-static const uint32_t READ_TIMEOUT_MS = 30000;       // 30s stalled read timeout
+static const uint32_t WIFI_CONNECT_RETRIES = 60;  // 60 * 0.5s = 30s
+static const uint32_t READ_TIMEOUT_MS = 30000;    // 30s stalled read timeout
 static const int MAX_REDIRECTS = 3;
 
 // Transfer parameters
-static const size_t CHUNK_SIZE = 1024;               // 1KB per chunk
-static const int MAX_ZERO_READS = 100;               // max consecutive zero reads before giving up
+static const size_t CHUNK_SIZE = 1024;  // 1KB per chunk
+static const int MAX_ZERO_READS =
+    100;  // max consecutive zero reads before giving up
 
 // SOF marker used for framing the UART stream
 static const uint8_t SOF_MARKER[4] = {0xAA, 0x55, 0xAA, 0x55};
@@ -73,7 +78,8 @@ void sendACKs(HardwareSerial& port) {
   port.print("ACK\n");
 }
 
-// Write SOF marker and 4-byte big-endian image size header to the given serial port
+// Write SOF marker and 4-byte big-endian image size header to the given serial
+// port
 void sendSOFHeader(HardwareSerial& port, uint32_t img_size) {
   port.write(SOF_MARKER, sizeof(SOF_MARKER));
   uint8_t header[4];
@@ -148,7 +154,6 @@ void blink_fast(unsigned long duration_ms) {
   }
 }
 
-
 // Stream image from HTTP directly to UART
 bool stream_image_to_uart(const char* url, HardwareSerial& port) {
   if (WiFi.status() != WL_CONNECTED) {
@@ -198,6 +203,10 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
     return false;
   }
   WiFiClient* stream = http.getStreamPtr();
+  // Send start-of-frame marker and header so the receiver can sync
+  Serial.println("Sending SOF marker and header to receiver...");
+  sendSOFHeader(port, IMAGE_SIZE);
+  Serial.println("SOF marker and header sent");
   uint8_t chunk[CHUNK_SIZE];
   size_t received = 0;
   unsigned long lastData = millis();
@@ -259,9 +268,10 @@ void loop() {
     cmd += '\n';  // Ensure newline is included for exact match
     if (cmd == "SENDIMG\n") {
       Serial.println("SENDIMG command received on Serial1");
-      // Send two ACKs to ensure the RP2040 sees the handshake
+      // Send two ACKs to ensure the RP2040 sees the handshake, then pause
       sendACKs(Serial1);
       Serial.println("ACKs sent to RP2040");
+      delay(100);       // give the RP2040 time to process the ACKs before SOF
       blink_fast(600);  // Rapid blink for 600ms while sending
       bool ok = stream_image_to_uart(IMAGE_URL, Serial1);
       if (ok) {
