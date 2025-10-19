@@ -6,32 +6,38 @@
 #include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>
 #include "env.h"
+#include "uart_helpers.h"
 
-#define LED_BUILTIN 2  // On most ESP32 boards, GPIO2 is the onboard LED
-#define UART_BAUD 115200
-#define UART_TX_PIN 1
-#define UART_RX_PIN 3
-#define IMAGE_WIDTH 800
-#define IMAGE_HEIGHT 480
-#define IMAGE_BPP 3  // 3 bits per pixel for 7-color e-Paper
-#undef IMAGE_SIZE
-#define IMAGE_SIZE 192000         // 192,000 bytes for 800x480 (Waveshare)
-uint8_t* image_buffer = nullptr;  // Will be allocated in PSRAM
+// ---------------------- Configuration / Constants ----------------------
+// Hardware
+static const int LED_GPIO = 2;            // On most ESP32 boards, GPIO2 is the onboard LED
+static const int SERIAL1_RX_PIN = 16;     // UART RX for Serial1 (RP2040 -> ESP32)
+static const int SERIAL1_TX_PIN = 17;     // UART TX for Serial1 (ESP32 -> RP2040)
+static const int UART_BAUD_RATE = 115200; // Standard UART baud used
 
-// Handshake pins for Serial1
-#define SERIAL1_RX 16
-#define SERIAL1_TX 17
+// Image characteristics
+static const uint32_t IMAGE_WIDTH = 800;
+static const uint32_t IMAGE_HEIGHT = 480;
+static const uint32_t IMAGE_BPP = 3;                 // 3 bits per pixel for 7-color e-Paper
+static const uint32_t IMAGE_SIZE = 192000;           // 192,000 bytes for 800x480 (Waveshare)
 
-// 7-color e-Paper color codes (3 bits per pixel)
-#define EPD_BLACK 0b000
-#define EPD_WHITE 0b001
-#define EPD_GREEN 0b010
-#define EPD_BLUE 0b011
-#define EPD_RED 0b100
-#define EPD_YELLOW 0b101
-#define EPD_ORANGE 0b110
-#define EPD_UNUSED 0b111
+// Networking / HTTP
+static const char IMAGE_URL[] = "https://europe-north1-kitche-epaper-renderer.cloudfunctions.net/epaper?format=raw";
+static const uint32_t HTTP_TIMEOUT_MS = 60000;       // 60s HTTP timeout
 
+// Timeouts and retries
+static const uint32_t WIFI_CONNECT_RETRIES = 60;     // 60 * 0.5s = 30s
+static const uint32_t READ_TIMEOUT_MS = 30000;       // 30s stalled read timeout
+static const int MAX_REDIRECTS = 3;
+
+// Transfer parameters
+static const size_t CHUNK_SIZE = 1024;               // 1KB per chunk
+static const int MAX_ZERO_READS = 100;               // max consecutive zero reads before giving up
+
+// SOF marker used for framing the UART stream
+static const uint8_t SOF_MARKER[4] = {0xAA, 0x55, 0xAA, 0x55};
+
+// LED state tracking
 unsigned long lastBlink = 0;
 bool ledState = false;
 
@@ -58,6 +64,21 @@ String getEnvVar(const char* filename, const char* key) {
   }
   f.close();
   return String("");
+}
+
+// Send two ACK lines with a short pause to make handshake more robust
+void sendACKs(HardwareSerial& port) {
+  port.print("ACK\n");
+  delay(50);
+  port.print("ACK\n");
+}
+
+// Write SOF marker and 4-byte big-endian image size header to the given serial port
+void sendSOFHeader(HardwareSerial& port, uint32_t img_size) {
+  port.write(SOF_MARKER, sizeof(SOF_MARKER));
+  uint8_t header[4];
+  buildImageHeader(img_size, header);
+  port.write(header, 4);
 }
 
 void connect_wifi() {
@@ -90,63 +111,18 @@ void connect_wifi() {
   }
 }
 
-// Download image from the internet and fill image_buffer
-bool download_image_to_buffer(const char* url) {
-  if (!image_buffer) {
-    Serial.println("Image buffer not allocated!");
-    return false;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected, cannot download image.");
-    return false;
-  }
-  HTTPClient http;
-  Serial.print("Downloading image: ");
-  Serial.println(url);
-  http.begin(url);
-  int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    Serial.print("HTTP GET failed, code: ");
-    Serial.println(httpCode);
-    http.end();
-    return false;
-  }
-  WiFiClient* stream = http.getStreamPtr();
-  size_t received = 0;
-  while (http.connected() && received < IMAGE_SIZE) {
-    if (stream->available()) {
-      int c = stream->read();
-      if (c < 0)
-        break;
-      image_buffer[received++] = (uint8_t)c;
-      if (received % 4096 == 0) {
-        Serial.printf("Downloaded %u/%u bytes\n", (unsigned)received,
-                      (unsigned)IMAGE_SIZE);
-      }
-    } else {
-      delay(1);
-    }
-  }
-  http.end();
-  if (received == IMAGE_SIZE) {
-    Serial.println("Image download complete!");
-    return true;
-  } else {
-    Serial.printf("Image download incomplete: %u/%u bytes\n",
-                  (unsigned)received, (unsigned)IMAGE_SIZE);
-    return false;
-  }
-}
+// NOTE: download_image_to_buffer was removed in favour of streaming directly
+// from the HTTP response to the UART to avoid double-buffering large images.
 
 void setup() {
-  Serial.begin(UART_BAUD);  // USB serial for debug
+  Serial.begin(UART_BAUD_RATE);  // USB serial for debug
   // Wait for serial connection
   while (!Serial) {
     delay(10);
   }
-  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(LED_GPIO, OUTPUT);
   // Initialize Serial1 for RP2040 UART
-  Serial1.begin(UART_BAUD, SERIAL_8N1, SERIAL1_RX, SERIAL1_TX);
+  Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, SERIAL1_RX_PIN, SERIAL1_TX_PIN);
   Serial.println("ESP32 ready for stateless SENDIMG protocol");
   connect_wifi();
   // Download test image at startup (optional, can be removed if not needed)
@@ -157,7 +133,7 @@ void blink_slow() {
   unsigned long now = millis();
   if (now - lastBlink >= 500) {  // 1 Hz (slow)
     ledState = !ledState;
-    digitalWrite(LED_BUILTIN, ledState);
+    digitalWrite(LED_GPIO, ledState);
     lastBlink = now;
   }
 }
@@ -165,14 +141,13 @@ void blink_slow() {
 void blink_fast(unsigned long duration_ms) {
   unsigned long start = millis();
   while (millis() - start < duration_ms) {
-    digitalWrite(LED_BUILTIN, HIGH);
+    digitalWrite(LED_GPIO, HIGH);
     delay(50);
-    digitalWrite(LED_BUILTIN, LOW);
+    digitalWrite(LED_GPIO, LOW);
     delay(50);
   }
 }
 
-#define CHUNK_SIZE 1024  // 1KB per chunk, adjust as needed
 
 // Stream image from HTTP directly to UART
 bool stream_image_to_uart(const char* url, HardwareSerial& port) {
@@ -284,13 +259,11 @@ void loop() {
     cmd += '\n';  // Ensure newline is included for exact match
     if (cmd == "SENDIMG\n") {
       Serial.println("SENDIMG command received on Serial1");
-      Serial1.print("ACK\n");
-      Serial.println("ACK sent to RP2040");
+      // Send two ACKs to ensure the RP2040 sees the handshake
+      sendACKs(Serial1);
+      Serial.println("ACKs sent to RP2040");
       blink_fast(600);  // Rapid blink for 600ms while sending
-      bool ok = stream_image_to_uart(
-          "https://europe-north1-kitche-epaper-renderer.cloudfunctions.net/"
-          "epaper?format=raw",
-          Serial1);
+      bool ok = stream_image_to_uart(IMAGE_URL, Serial1);
       if (ok) {
         Serial.println("Image streamed to RP2040 on Serial1");
       } else {

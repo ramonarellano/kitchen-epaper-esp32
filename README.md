@@ -10,6 +10,11 @@ This is a PlatformIO project for the NodeMCU-32S (ESP32) board. It implements a 
   - Retries handshake indefinitely until successful.
   - Debug output to USB serial (Serial) shows all received bytes and handshake status.
 
+- **Image download from cloudfunctions.net:**
+  - Uses the cloud application kitchen-epaper-renderer running in Azure
+  - Retrieves a RAW image through a URL, but the URL can be tested in a browser by asking for a PNG:
+  https://europe-north1-kitche-epaper-renderer.cloudfunctions.net/epaper?format=png
+
 - **Image Transfer:**
   - Listens for the command `SENDIMG` on USB serial (Serial).
   - Responds by sending a hardcoded 800x480 1bpp 2x2 checkerboard pattern image buffer.
