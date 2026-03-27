@@ -87,23 +87,27 @@ void sendSOFHeader(HardwareSerial& port, uint32_t img_size) {
   port.write(header, 4);
 }
 
-void connect_wifi() {
+bool connect_wifi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
   if (!SPIFFS.begin(true)) {
     Serial.println("SPIFFS mount failed!");
-    return;
+    return false;
   }
   String ssid = getEnvVar("/.env", "WIFI_SSID");
   String pass = getEnvVar("/.env", "WIFI_PASS");
   if (ssid == "" || pass == "") {
     Serial.println("WiFi credentials not found in /.env!");
-    return;
+    return false;
   }
   Serial.print("Connecting to WiFi: ");
   Serial.println(ssid);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), pass.c_str());
   int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 60) {  // 30s timeout
+  while (WiFi.status() != WL_CONNECTED && retries < WIFI_CONNECT_RETRIES) {
     delay(500);
     Serial.print(".");
     retries++;
@@ -112,8 +116,10 @@ void connect_wifi() {
     Serial.println("\nWiFi connected!");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
+    return true;
   } else {
     Serial.println("\nWiFi connection failed!");
+    return false;
   }
 }
 
@@ -268,6 +274,15 @@ void loop() {
     cmd += '\n';  // Ensure newline is included for exact match
     if (cmd == "SENDIMG\n") {
       Serial.println("SENDIMG command received on Serial1");
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println(
+            "WiFi disconnected; attempting reconnect before image fetch...");
+        if (!connect_wifi()) {
+          Serial.println(
+              "ERROR: WiFi reconnect failed. Waiting for next request.");
+          return;
+        }
+      }
       // Send two ACKs to ensure the RP2040 sees the handshake, then pause
       sendACKs(Serial1);
       Serial.println("ACKs sent to RP2040");
