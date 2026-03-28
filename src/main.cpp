@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>
+#include "debug_logger.h"
 #include "env.h"
 #include "uart_helpers.h"
 
@@ -31,7 +32,9 @@ static const uint32_t HTTP_TIMEOUT_MS = 60000;  // 60s HTTP timeout
 
 // Timeouts and retries
 static const uint32_t WIFI_CONNECT_RETRIES = 60;  // 60 * 0.5s = 30s
-static const uint32_t READ_TIMEOUT_MS = 30000;    // 30s stalled read timeout
+static const uint32_t WIFI_RECONNECT_INTERVAL_MS = 30000;
+static const uint32_t WIFI_RESET_DELAY_MS = 250;
+static const uint32_t READ_TIMEOUT_MS = 30000;  // 30s stalled read timeout
 static const int MAX_REDIRECTS = 3;
 
 // Transfer parameters
@@ -45,6 +48,43 @@ static const uint8_t SOF_MARKER[4] = {0xAA, 0x55, 0xAA, 0x55};
 // LED state tracking
 unsigned long lastBlink = 0;
 bool ledState = false;
+bool spiffsReady = false;
+String wifiSsid;
+String wifiPass;
+unsigned long lastWifiReconnectAttempt = 0;
+
+bool ensure_spiffs_ready() {
+  if (spiffsReady) {
+    return true;
+  }
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed!");
+    return false;
+  }
+
+  spiffsReady = true;
+  return true;
+}
+
+bool load_wifi_credentials() {
+  if (wifiSsid.length() > 0 && wifiPass.length() > 0) {
+    return true;
+  }
+
+  if (!ensure_spiffs_ready()) {
+    return false;
+  }
+
+  wifiSsid = getEnvVar("/.env", "WIFI_SSID");
+  wifiPass = getEnvVar("/.env", "WIFI_PASS");
+  if (wifiSsid.length() == 0 || wifiPass.length() == 0) {
+    Serial.println("WiFi credentials not found in /.env!");
+    return false;
+  }
+
+  return true;
+}
 
 String getEnvVar(const char* filename, const char* key) {
   File f = SPIFFS.open(filename, "r");
@@ -92,20 +132,23 @@ bool connect_wifi() {
     return true;
   }
 
-  if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS mount failed!");
+  if (!load_wifi_credentials()) {
     return false;
   }
-  String ssid = getEnvVar("/.env", "WIFI_SSID");
-  String pass = getEnvVar("/.env", "WIFI_PASS");
-  if (ssid == "" || pass == "") {
-    Serial.println("WiFi credentials not found in /.env!");
-    return false;
-  }
+
   Serial.print("Connecting to WiFi: ");
-  Serial.println(ssid);
+  Serial.println(wifiSsid);
+  debug_log_connect_start(wifiSsid.c_str());
+  lastWifiReconnectAttempt = millis();
+
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.disconnect(true);
+  delay(WIFI_RESET_DELAY_MS);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), pass.c_str());
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+
   int retries = 0;
   while (WiFi.status() != WL_CONNECTED && retries < WIFI_CONNECT_RETRIES) {
     delay(500);
@@ -116,11 +159,27 @@ bool connect_wifi() {
     Serial.println("\nWiFi connected!");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
+    debug_log_connect_success(WiFi.localIP().toString().c_str(), WiFi.RSSI());
     return true;
   } else {
-    Serial.println("\nWiFi connection failed!");
+    Serial.printf("\nWiFi connection failed! status=%d\n", WiFi.status());
+    debug_log_connect_failed(WiFi.status(), retries);
     return false;
   }
+}
+
+void maintain_wifi_connection(unsigned long now) {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  if (now - lastWifiReconnectAttempt < WIFI_RECONNECT_INTERVAL_MS) {
+    return;
+  }
+
+  Serial.println("WiFi disconnected; attempting background reconnect...");
+  debug_log_reconnect_attempt();
+  connect_wifi();
 }
 
 // NOTE: download_image_to_buffer was removed in favour of streaming directly
@@ -137,6 +196,7 @@ void setup() {
   Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, SERIAL1_RX_PIN, SERIAL1_TX_PIN);
   Serial.println("ESP32 ready for stateless SENDIMG protocol");
   connect_wifi();
+  debug_log_init();
   // Download test image at startup (optional, can be removed if not needed)
   // download_image_to_buffer("https://drive.google.com/uc?export=download&id=1vwwSW9DbbUZ_H7Q_CaS0rMNKG6HDWAHh");
 }
@@ -171,8 +231,9 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
   const int maxRedirects = 3;
   HTTPClient http;
   int httpCode = 0;
-  while (redirectCount < maxRedirects) {
-    http.setTimeout(60000);  // 60s timeout for large images
+  while (redirectCount < MAX_REDIRECTS) {
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.setReuse(false);
     http.setUserAgent("ESP32/1.0");
     http.begin(currentUrl);
     httpCode = http.GET();
@@ -205,6 +266,7 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
     String payload = http.getString();
     Serial.print("HTTP error payload: ");
     Serial.println(payload);
+    debug_log_http_error(currentUrl.c_str(), httpCode);
     http.end();
     return false;
   }
@@ -216,9 +278,7 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
   uint8_t chunk[CHUNK_SIZE];
   size_t received = 0;
   unsigned long lastData = millis();
-  const unsigned long readTimeout = 30000;  // 30s timeout for stalled reads
   int zeroReadCount = 0;
-  const int maxZeroReads = 100;  // Allow up to 100 consecutive zero-byte reads
   while (http.connected() && received < IMAGE_SIZE) {
     size_t to_read = (IMAGE_SIZE - received > CHUNK_SIZE)
                          ? CHUNK_SIZE
@@ -238,7 +298,7 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
     } else {
       if (stream->available() == 0) {
         zeroReadCount++;
-        if (zeroReadCount > maxZeroReads) {
+        if (zeroReadCount > MAX_ZERO_READS) {
           Serial.println(
               "No more data from stream (max zero reads reached), breaking "
               "loop.");
@@ -247,8 +307,8 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
       } else {
         zeroReadCount = 0;
       }
-      if (millis() - lastData > readTimeout) {
-        Serial.println("Read timeout: no data received for 10s");
+      if (millis() - lastData > READ_TIMEOUT_MS) {
+        Serial.println("Read timeout: no data received for 30s");
         break;
       }
       delay(10);
@@ -261,6 +321,7 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
   } else {
     Serial.printf("Image streaming incomplete: %u/%u bytes\n",
                   (unsigned)received, (unsigned)IMAGE_SIZE);
+    debug_log_stream_error("incomplete transfer or timeout", received);
     return false;
   }
 }
@@ -268,11 +329,16 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
 unsigned long lastStatusLog = 0;
 
 void loop() {
+  unsigned long now = millis();
+  maintain_wifi_connection(now);
+
   // Listen for image request from RP2040 on Serial1
   if (Serial1.available()) {
     String cmd = Serial1.readStringUntil('\n');
     cmd += '\n';  // Ensure newline is included for exact match
-    if (cmd == "SENDIMG\n") {
+    if (cmd == "GETLOG\n") {
+      debug_log_dump_to_serial();
+    } else if (cmd == "SENDIMG\n") {
       Serial.println("SENDIMG command received on Serial1");
       if (WiFi.status() != WL_CONNECTED) {
         Serial.println(
@@ -296,10 +362,11 @@ void loop() {
             "ERROR: Image streaming to RP2040 failed. Waiting for next "
             "request.");
       }
+    } else {
+      Serial.printf("Unknown command: %s", cmd.c_str());
     }
   }
   // Status log every 5 seconds
-  unsigned long now = millis();
   if (now - lastStatusLog >= 5000) {
     Serial.println("Waiting for SENDIMG request on Serial1...");
     lastStatusLog = now;
