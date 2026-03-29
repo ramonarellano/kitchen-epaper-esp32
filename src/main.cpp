@@ -244,13 +244,13 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
   int redirectCount = 0;
   const int maxRedirects = 3;
   HTTPClient http;
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();  // skip cert pin for cloud function endpoint
   int httpCode = 0;
   while (redirectCount < MAX_REDIRECTS) {
     http.setTimeout(HTTP_TIMEOUT_MS);
     http.setReuse(false);
     http.setUserAgent("ESP32/1.0");
-    WiFiClientSecure secureClient;
-    secureClient.setInsecure();  // skip cert pin for cloud function endpoint
     http.begin(secureClient, currentUrl);
     httpCode = http.GET();
     Serial.printf("HTTP GET %s -> code: %d\n", currentUrl.c_str(), httpCode);
