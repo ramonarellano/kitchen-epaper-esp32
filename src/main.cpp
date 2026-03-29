@@ -5,8 +5,11 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>
+#include <esp_sleep.h>
 #include "debug_logger.h"
 #include "env.h"
+#include "soc/rtc_cntl_reg.h"
+#include "soc/soc.h"
 #include "uart_helpers.h"
 
 // ---------------------- Configuration / Constants ----------------------
@@ -199,7 +202,8 @@ void maintain_wifi_connection(unsigned long now) {
 // from the HTTP response to the UART to avoid double-buffering large images.
 
 void setup() {
-  Serial.begin(UART_BAUD_RATE);  // USB serial for debug
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // disable brownout detector
+  Serial.begin(UART_BAUD_RATE);               // USB serial for debug
   // Wait for serial connection (with timeout for headless operation)
   unsigned long serialWaitStart = millis();
   while (!Serial && millis() - serialWaitStart < 3000) {
@@ -398,7 +402,13 @@ void loop() {
       bool ok = stream_image_to_uart(IMAGE_URL, Serial1);
       if (ok) {
         Serial.println("Image streamed to RP2040 on Serial1");
-        debug_log_event("Image streamed successfully", "target=Serial1");
+        debug_log_event("Image streamed successfully, sleeping 2min",
+                        "target=Serial1");
+        Serial.flush();
+        // Deep sleep for 2 minutes so ESP32 doesn't compete for power
+        // while the RP2040 refreshes the e-paper display.
+        esp_sleep_enable_timer_wakeup(120ULL * 1000000ULL);  // 120 seconds
+        esp_deep_sleep_start();
       } else {
         Serial.println(
             "ERROR: Image streaming to RP2040 failed. Waiting for next "
