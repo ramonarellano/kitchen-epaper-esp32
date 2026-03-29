@@ -45,6 +45,9 @@ static const int MAX_ZERO_READS =
 // SOF marker used for framing the UART stream
 static const uint8_t SOF_MARKER[4] = {0xAA, 0x55, 0xAA, 0x55};
 
+// WiFi recovery
+static const int MAX_CONSECUTIVE_WIFI_FAILURES = 3;
+
 // LED state tracking
 unsigned long lastBlink = 0;
 bool ledState = false;
@@ -52,14 +55,17 @@ bool spiffsReady = false;
 String wifiSsid;
 String wifiPass;
 unsigned long lastWifiReconnectAttempt = 0;
+int consecutiveWifiFailures = 0;
 
 bool ensure_spiffs_ready() {
   if (spiffsReady) {
     return true;
   }
 
-  if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS mount failed!");
+  // Do not auto-format on mount failure: preserving persisted logs is safer
+  // than recovering a damaged filesystem by erasing it.
+  if (!SPIFFS.begin(false)) {
+    Serial.println("SPIFFS mount failed (no auto-format).");
     return false;
   }
 
@@ -160,10 +166,17 @@ bool connect_wifi() {
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
     debug_log_connect_success(WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    consecutiveWifiFailures = 0;
     return true;
   } else {
     Serial.printf("\nWiFi connection failed! status=%d\n", WiFi.status());
     debug_log_connect_failed(WiFi.status(), retries);
+    consecutiveWifiFailures++;
+    if (consecutiveWifiFailures >= MAX_CONSECUTIVE_WIFI_FAILURES) {
+      debug_log_event("Too many consecutive WiFi failures, rebooting ESP32");
+      delay(100);
+      ESP.restart();
+    }
     return false;
   }
 }
@@ -187,16 +200,17 @@ void maintain_wifi_connection(unsigned long now) {
 
 void setup() {
   Serial.begin(UART_BAUD_RATE);  // USB serial for debug
-  // Wait for serial connection
-  while (!Serial) {
+  // Wait for serial connection (with timeout for headless operation)
+  unsigned long serialWaitStart = millis();
+  while (!Serial && millis() - serialWaitStart < 3000) {
     delay(10);
   }
   pinMode(LED_GPIO, OUTPUT);
   // Initialize Serial1 for RP2040 UART
   Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, SERIAL1_RX_PIN, SERIAL1_TX_PIN);
   Serial.println("ESP32 ready for stateless SENDIMG protocol");
-  connect_wifi();
   debug_log_init();
+  connect_wifi();
   // Download test image at startup (optional, can be removed if not needed)
   // download_image_to_buffer("https://drive.google.com/uc?export=download&id=1vwwSW9DbbUZ_H7Q_CaS0rMNKG6HDWAHh");
 }
@@ -235,7 +249,9 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
     http.setTimeout(HTTP_TIMEOUT_MS);
     http.setReuse(false);
     http.setUserAgent("ESP32/1.0");
-    http.begin(currentUrl);
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();  // skip cert pin for cloud function endpoint
+    http.begin(secureClient, currentUrl);
     httpCode = http.GET();
     Serial.printf("HTTP GET %s -> code: %d\n", currentUrl.c_str(), httpCode);
     // Print HTTP headers for diagnostics
@@ -332,20 +348,45 @@ void loop() {
   unsigned long now = millis();
   maintain_wifi_connection(now);
 
+  if (Serial.available()) {
+    String usbCmd = Serial.readStringUntil('\n');
+    usbCmd.trim();
+    if (usbCmd == "GETLOG") {
+      debug_log_dump_to_serial();
+    } else if (usbCmd == "CLEARLOG") {
+      debug_log_clear();
+      Serial.println("[DEBUG] Persistent log cleared");
+    } else if (usbCmd.length() > 0) {
+      Serial.printf("Unknown USB command: %s\n", usbCmd.c_str());
+    }
+  }
+
   // Listen for image request from RP2040 on Serial1
   if (Serial1.available()) {
     String cmd = Serial1.readStringUntil('\n');
     cmd += '\n';  // Ensure newline is included for exact match
     if (cmd == "GETLOG\n") {
-      debug_log_dump_to_serial();
+      debug_log_dump_to_stream(Serial1);
     } else if (cmd == "SENDIMG\n") {
+      // Drain any additional queued SENDIMG commands to avoid processing
+      // stale requests that piled up while WiFi was down.
+      delay(50);  // let UART buffer fill with any trailing commands
+      while (Serial1.available()) {
+        String stale = Serial1.readStringUntil('\n');
+        stale.trim();
+        if (stale.length() > 0) {
+          Serial.printf("Drained stale UART command: %s\n", stale.c_str());
+        }
+      }
       Serial.println("SENDIMG command received on Serial1");
+      debug_log_event("SENDIMG command received", "source=Serial1");
       if (WiFi.status() != WL_CONNECTED) {
         Serial.println(
             "WiFi disconnected; attempting reconnect before image fetch...");
         if (!connect_wifi()) {
           Serial.println(
               "ERROR: WiFi reconnect failed. Waiting for next request.");
+          debug_log_event("SENDIMG aborted", "wifi reconnect failed");
           return;
         }
       }
@@ -357,13 +398,17 @@ void loop() {
       bool ok = stream_image_to_uart(IMAGE_URL, Serial1);
       if (ok) {
         Serial.println("Image streamed to RP2040 on Serial1");
+        debug_log_event("Image streamed successfully", "target=Serial1");
       } else {
         Serial.println(
             "ERROR: Image streaming to RP2040 failed. Waiting for next "
             "request.");
+        debug_log_event("Image streaming failed", "target=Serial1");
       }
     } else {
       Serial.printf("Unknown command: %s", cmd.c_str());
+      String details = String("raw=") + cmd;
+      debug_log_event("Unknown Serial1 command", details.c_str());
     }
   }
   // Status log every 5 seconds

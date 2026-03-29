@@ -13,7 +13,7 @@ This is a PlatformIO project for the NodeMCU-32S (ESP32) board. It implements a 
 - **Image download from cloudfunctions.net:**
   - Uses the cloud application kitchen-epaper-renderer running in Azure
   - Retrieves a RAW image through a URL, but the URL can be tested in a browser by asking for a PNG:
-  https://europe-north1-kitche-epaper-renderer.cloudfunctions.net/epaper?format=png
+  <https://europe-north1-kitche-epaper-renderer.cloudfunctions.net/epaper?format=png>
 
 - **Image Transfer:**
   - Listens for the command `SENDIMG` on USB serial (Serial).
@@ -36,12 +36,56 @@ This is a PlatformIO project for the NodeMCU-32S (ESP32) board. It implements a 
 4. Build and upload the firmware using the PlatformIO toolbar or the command palette.
 
 ## File Structure
+
 - `platformio.ini`: PlatformIO configuration for the ESP32 board.
 - `src/main.cpp`: Main application code (UART handshake, image transfer, LED logic).
 
 ## Serial Monitor
+
 - USB Serial (Serial): 115200 baud (for debug and `SENDIMG` command)
 - Serial1 (GPIO16/17): 115200 baud (for handshake with RP2040)
+
+## Persistent Debug Logging (Standalone Overnight)
+
+The firmware stores debug events in SPIFFS so logs survive reboot/power cycle.
+
+- Log file on device: `/debug_log.txt`
+- Boot counter file on device: `/boot_count.txt`
+- Maximum log size: 64KB (oldest entries are trimmed when full)
+- USB commands:
+  - `GETLOG` prints the stored log
+  - `CLEARLOG` deletes the stored log
+
+Important behavior:
+
+- Logs are appended on boot; they are not cleared automatically when you plug the ESP32 into a computer.
+- SPIFFS mount is configured without auto-format, so a mount failure will not erase logs.
+
+## Export Stored Logs To Host File
+
+Use the script in this repo to dump stored logs into the local `logs/` folder with a timestamped filename.
+
+1. Install dependency:
+
+  ```sh
+  python3 -m pip install pyserial
+  ```
+
+1. Run export script:
+
+  ```sh
+  python3 export_esp32_logs.py
+  ```
+
+1. Optional: choose serial port manually:
+
+  ```sh
+  python3 export_esp32_logs.py --port /dev/cu.usbserial-0001
+  ```
+
+Output file example:
+
+- `logs/esp32-debug-20260329-093000.log`
 
 ## WiFi Credentials Setup
 
@@ -59,10 +103,13 @@ WiFi credentials are **not hardcoded** in the firmware. Instead, they are loaded
 2. Upload the `/data/.env` file to the ESP32's SPIFFS filesystem:
 
    - Build the SPIFFS image:
+
      ```sh
      pio run --target buildfs
      ```
+
    - Upload the SPIFFS image to the device:
+
      ```sh
      platformio run --target uploadfs
      ```

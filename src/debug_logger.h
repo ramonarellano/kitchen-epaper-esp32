@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <SPIFFS.h>
+#include <esp_system.h>
 #include <time.h>
 
 // ============================================================================
@@ -11,7 +12,57 @@ static const bool DEBUG_LOGGING_ENABLED = true;  // Set to false to disable all 
 
 // Log file on SPIFFS
 static const char DEBUG_LOG_FILE[] = "/debug_log.txt";
+static const char DEBUG_BOOT_COUNTER_FILE[] = "/boot_count.txt";
 static const uint32_t MAX_LOG_SIZE = 65536;  // 64KB max log file (circular)
+static uint32_t debug_log_boot_count = 0;
+
+void debug_log_event(const char* event, const char* details = nullptr);
+
+static uint32_t debug_log_read_boot_count() {
+  File counterFile = SPIFFS.open(DEBUG_BOOT_COUNTER_FILE, "r");
+  if (!counterFile) return 0;
+
+  String value = counterFile.readStringUntil('\n');
+  counterFile.close();
+  value.trim();
+  return (uint32_t)value.toInt();
+}
+
+static void debug_log_write_boot_count(uint32_t count) {
+  File counterFile = SPIFFS.open(DEBUG_BOOT_COUNTER_FILE, "w");
+  if (!counterFile) return;
+  counterFile.printf("%lu\n", (unsigned long)count);
+  counterFile.close();
+}
+
+static const char* debug_log_reset_reason_name(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_UNKNOWN:
+      return "UNKNOWN";
+    case ESP_RST_POWERON:
+      return "POWERON";
+    case ESP_RST_EXT:
+      return "EXTERNAL";
+    case ESP_RST_SW:
+      return "SOFTWARE";
+    case ESP_RST_PANIC:
+      return "PANIC";
+    case ESP_RST_INT_WDT:
+      return "INT_WDT";
+    case ESP_RST_TASK_WDT:
+      return "TASK_WDT";
+    case ESP_RST_WDT:
+      return "WDT";
+    case ESP_RST_DEEPSLEEP:
+      return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:
+      return "BROWNOUT";
+    case ESP_RST_SDIO:
+      return "SDIO";
+    default:
+      return "OTHER";
+  }
+}
 
 // ============================================================================
 // Internal helpers (only used when DEBUG_LOGGING_ENABLED is true)
@@ -57,9 +108,15 @@ static void debug_log_trim_if_needed() {
 
 static String debug_log_timestamp() {
   time_t now = time(nullptr);
-  struct tm* timeinfo = localtime(&now);
-  char buf[32];
-  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", timeinfo);
+  char buf[64];
+  if (now > 1704067200) {
+    struct tm* timeinfo = localtime(&now);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", timeinfo);
+  } else {
+    snprintf(buf, sizeof(buf), "boot=%lu +%lums",
+             (unsigned long)debug_log_boot_count,
+             (unsigned long)millis());
+  }
   return String(buf);
 }
 
@@ -73,11 +130,20 @@ void debug_log_init() {
   if (!SPIFFS.begin(false)) {
     Serial.println("[DEBUG] SPIFFS already mounted or unavailable");
   }
+  debug_log_boot_count = debug_log_read_boot_count() + 1;
+  debug_log_write_boot_count(debug_log_boot_count);
   debug_log_trim_if_needed();
   Serial.println("[DEBUG] Debug logging initialized");
+
+  char buf[160];
+  esp_reset_reason_t reason = esp_reset_reason();
+  snprintf(buf, sizeof(buf), "==== Boot #%lu start | reset=%s (%d) ====",
+           (unsigned long)debug_log_boot_count,
+           debug_log_reset_reason_name(reason), (int)reason);
+  debug_log_event(buf);
 }
 
-void debug_log_event(const char* event, const char* details = nullptr) {
+void debug_log_event(const char* event, const char* details) {
   if (!DEBUG_LOGGING_ENABLED) return;
   
   debug_log_trim_if_needed();
@@ -162,24 +228,28 @@ void debug_log_stream_error(const char* error_msg, uint32_t bytes_received) {
 // Retrieve logs (for debugging via serial command)
 // ============================================================================
 
-void debug_log_dump_to_serial() {
+void debug_log_dump_to_stream(Stream& out) {
   if (!DEBUG_LOGGING_ENABLED) {
-    Serial.println("[DEBUG] Logging is disabled");
+    out.println("[DEBUG] Logging is disabled");
     return;
   }
   
   File logFile = SPIFFS.open(DEBUG_LOG_FILE, "r");
   if (!logFile) {
-    Serial.println("[DEBUG] No log file found");
+    out.println("[DEBUG] No log file found");
     return;
   }
   
-  Serial.println("\n=== Debug Log Contents ===");
+  out.println("\n=== Debug Log Contents ===");
   while (logFile.available()) {
-    Serial.print((char)logFile.read());
+    out.print((char)logFile.read());
   }
   logFile.close();
-  Serial.println("=== End of Log ===\n");
+  out.println("=== End of Log ===\n");
+}
+
+void debug_log_dump_to_serial() {
+  debug_log_dump_to_stream(Serial);
 }
 
 void debug_log_clear() {
