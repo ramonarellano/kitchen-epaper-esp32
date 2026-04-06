@@ -63,10 +63,14 @@ Important behavior:
 
 ## Power Management and Reliability
 
-The ESP32 shares a power rail with the RP2040 and the 7.3" e-paper panel. The panel refresh draws significant current, which can cause brownout resets on the ESP32. The following mitigations are in place:
+The ESP32 shares a power rail with the RP2040 and the 7.3" e-paper panel. The panel refresh draws significant current, which can cause full power-on resets (voltage collapse) on the ESP32. The following mitigations are in place:
 
+- **Deferred WiFi** — WiFi is kept off (`WiFi.mode(WIFI_OFF)`) at boot and only activated when a `SENDIMG` command is received. This eliminates idle radio power draw (~150mA continuous) during the ~58 minute wait between image requests, preventing TX current spikes from contributing to voltage dips on the shared power rail.
+- **WiFi disconnect on failure** — if image streaming fails, WiFi is explicitly disconnected and the radio is turned off (`WiFi.disconnect(true)` + `WiFi.mode(WIFI_OFF)`) to avoid leaving the radio active during idle wait.
+- **Guarded WiFi maintenance** — background WiFi reconnection (`maintain_wifi_connection()`) is gated by a `wifiActivated` flag so it only runs after an intentional connect, preventing it from re-enabling the radio during the idle wait period.
+- **58-minute deep sleep after image transfer** — after successfully streaming the image to the RP2040, the ESP32 enters deep sleep for 58 minutes (~10µA draw). The Pico requests a new image every 60 minutes, so the ESP32 wakes ~2 minutes before the next request. This keeps the ESP32 asleep during the e-paper panel refresh (which causes the largest current draw on the shared rail) and for the entire idle period.
+- **RTC-level reset reason logging** — boot logs include both the IDF reset reason (`esp_reset_reason()`) and the hardware RTC reset reason (`rtc_get_reset_reason()`). This distinguishes true power-on resets (`rtc_reason=1`) from brownout resets (`rtc_reason=15`) and watchdog resets, aiding diagnosis of power rail issues.
 - **Brownout detector** — left enabled (default). Disabling it masks the underlying power issue and risks silent corruption. The includes for toggling it are kept in `main.cpp` for diagnostic use. To disable temporarily, add `WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);` at the top of `setup()`.
-- **Deep sleep after image transfer** — after successfully streaming the image to the RP2040, the ESP32 enters deep sleep for 2 minutes. This drops power draw to ~10µA during the panel refresh window, giving the display the full power budget.
 - **WiFi auto-reboot** — after 3 consecutive WiFi connection failures, the ESP32 reboots itself (`ESP.restart()`) to recover from stuck radio states.
 - **Stale command drain** — queued SENDIMG commands are drained from the UART buffer before processing, preventing a backlog from blocking the main loop.
 - **Explicit HTTPS client** — uses `WiFiClientSecure` (with `setInsecure()`) for proper TLS handling of the cloud function endpoint.

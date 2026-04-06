@@ -411,12 +411,13 @@ void loop() {
       bool ok = stream_image_to_uart(IMAGE_URL, Serial1);
       if (ok) {
         Serial.println("Image streamed to RP2040 on Serial1");
-        debug_log_event("Image streamed successfully, sleeping 2min",
+        debug_log_event("Image streamed successfully, sleeping 58min",
                         "target=Serial1");
         Serial.flush();
-        // Deep sleep for 2 minutes so ESP32 doesn't compete for power
-        // while the RP2040 refreshes the e-paper display.
-        esp_sleep_enable_timer_wakeup(120ULL * 1000000ULL);  // 120 seconds
+        // Deep sleep for 58 minutes — the Pico requests a new image every
+        // 60 minutes, so we wake just before the next request arrives.
+        esp_sleep_enable_timer_wakeup(3480ULL *
+                                      1000000ULL);  // 3480 seconds = 58 min
         esp_deep_sleep_start();
       } else {
         Serial.println(
