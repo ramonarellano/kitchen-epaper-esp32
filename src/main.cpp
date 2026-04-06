@@ -51,6 +51,10 @@ static const uint8_t SOF_MARKER[4] = {0xAA, 0x55, 0xAA, 0x55};
 // WiFi recovery
 static const int MAX_CONSECUTIVE_WIFI_FAILURES = 3;
 
+// Track whether WiFi was intentionally started (to prevent maintain_wifi from
+// reconnecting while we want the radio off during idle wait).
+bool wifiActivated = false;
+
 // LED state tracking
 unsigned long lastBlink = 0;
 bool ledState = false;
@@ -185,6 +189,10 @@ bool connect_wifi() {
 }
 
 void maintain_wifi_connection(unsigned long now) {
+  if (!wifiActivated) {
+    return;  // WiFi intentionally off; don't reconnect during idle wait
+  }
+
   if (WiFi.status() == WL_CONNECTED) {
     return;
   }
@@ -384,6 +392,7 @@ void loop() {
       }
       Serial.println("SENDIMG command received on Serial1");
       debug_log_event("SENDIMG command received", "source=Serial1");
+      wifiActivated = true;
       if (WiFi.status() != WL_CONNECTED) {
         Serial.println(
             "WiFi disconnected; attempting reconnect before image fetch...");
@@ -416,6 +425,7 @@ void loop() {
         debug_log_event("Image streaming failed", "target=Serial1");
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
+        wifiActivated = false;
       }
     } else {
       Serial.printf("Unknown command: %s", cmd.c_str());
