@@ -202,8 +202,7 @@ void maintain_wifi_connection(unsigned long now) {
 // from the HTTP response to the UART to avoid double-buffering large images.
 
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // disable brownout detector
-  Serial.begin(UART_BAUD_RATE);               // USB serial for debug
+  Serial.begin(UART_BAUD_RATE);  // USB serial for debug
   // Wait for serial connection (with timeout for headless operation)
   unsigned long serialWaitStart = millis();
   while (!Serial && millis() - serialWaitStart < 3000) {
@@ -214,7 +213,8 @@ void setup() {
   Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, SERIAL1_RX_PIN, SERIAL1_TX_PIN);
   Serial.println("ESP32 ready for stateless SENDIMG protocol");
   debug_log_init();
-  connect_wifi();
+  // WiFi is deferred until SENDIMG is received to avoid idle power draw
+  WiFi.mode(WIFI_OFF);
   // Download test image at startup (optional, can be removed if not needed)
   // download_image_to_buffer("https://drive.google.com/uc?export=download&id=1vwwSW9DbbUZ_H7Q_CaS0rMNKG6HDWAHh");
 }
@@ -414,6 +414,8 @@ void loop() {
             "ERROR: Image streaming to RP2040 failed. Waiting for next "
             "request.");
         debug_log_event("Image streaming failed", "target=Serial1");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
       }
     } else {
       Serial.printf("Unknown command: %s", cmd.c_str());

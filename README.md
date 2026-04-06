@@ -65,7 +65,7 @@ Important behavior:
 
 The ESP32 shares a power rail with the RP2040 and the 7.3" e-paper panel. The panel refresh draws significant current, which can cause brownout resets on the ESP32. The following mitigations are in place:
 
-- **Brownout detector disabled** — prevents infinite reboot loops when the display refresh causes a voltage dip. Added via `WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0)` in `setup()`.
+- **Brownout detector** — left enabled (default). Disabling it masks the underlying power issue and risks silent corruption. The includes for toggling it are kept in `main.cpp` for diagnostic use. To disable temporarily, add `WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);` at the top of `setup()`.
 - **Deep sleep after image transfer** — after successfully streaming the image to the RP2040, the ESP32 enters deep sleep for 2 minutes. This drops power draw to ~10µA during the panel refresh window, giving the display the full power budget.
 - **WiFi auto-reboot** — after 3 consecutive WiFi connection failures, the ESP32 reboots itself (`ESP.restart()`) to recover from stuck radio states.
 - **Stale command drain** — queued SENDIMG commands are drained from the UART buffer before processing, preventing a backlog from blocking the main loop.
