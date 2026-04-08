@@ -4,11 +4,11 @@
 #include <SPIFFS.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <driver/gpio.h>
 #include <esp_heap_caps.h>
 #include <esp_sleep.h>
 #include "debug_logger.h"
 #include "env.h"
-#include <driver/gpio.h>
 #include "soc/rtc_cntl_reg.h"
 #include "soc/soc.h"
 #include "uart_helpers.h"
