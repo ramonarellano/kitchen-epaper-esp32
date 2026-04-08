@@ -8,6 +8,7 @@
 #include <esp_sleep.h>
 #include "debug_logger.h"
 #include "env.h"
+#include <driver/gpio.h>
 #include "soc/rtc_cntl_reg.h"
 #include "soc/soc.h"
 #include "uart_helpers.h"
@@ -299,6 +300,18 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
     return false;
   }
   WiFiClient* stream = http.getStreamPtr();
+  // Validate Content-Length before committing to the transfer (Bug #9 fix).
+  // If the renderer returns an error page or wrong-sized response, bail out
+  // before sending SOF — otherwise the RP2040 waits 3 minutes for data that
+  // will never arrive.
+  int contentLength = http.getSize();
+  if (contentLength > 0 && (uint32_t)contentLength != IMAGE_SIZE) {
+    Serial.printf("Unexpected Content-Length: %d (expected %u)\n",
+                  contentLength, (unsigned)IMAGE_SIZE);
+    debug_log_event("Content-Length mismatch, aborting transfer");
+    http.end();
+    return false;
+  }
   // Send start-of-frame marker and header so the receiver can sync
   Serial.println("Sending SOF marker and header to receiver...");
   sendSOFHeader(port, IMAGE_SIZE);
@@ -413,6 +426,15 @@ void loop() {
         Serial.println("Image streamed to RP2040 on Serial1");
         debug_log_event("Image streamed successfully, sleeping 58min",
                         "target=Serial1");
+        // Isolate UART GPIOs and shut down peripherals before deep sleep
+        // to prevent parasitic current or EN pin glitches from the Pico's
+        // TX line driving into the sleeping ESP32.
+        Serial1.end();
+        gpio_set_direction((gpio_num_t)SERIAL1_RX_PIN, GPIO_MODE_DISABLE);
+        gpio_set_direction((gpio_num_t)SERIAL1_TX_PIN, GPIO_MODE_DISABLE);
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        debug_log_event("Pre-sleep: UART+WiFi off, GPIOs isolated");
         Serial.flush();
         // Deep sleep for 58 minutes — the Pico requests a new image every
         // 60 minutes, so we wake just before the next request arrives.

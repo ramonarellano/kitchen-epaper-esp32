@@ -152,6 +152,16 @@ void debug_log_init() {
            debug_log_reset_reason_name(reason), (int)reason, (int)rtc_reason);
   debug_log_event(buf);
 
+  // Log brownout detector status, wake cause, and heap for diagnosing
+  // spurious POWERON resets during deep sleep
+  uint32_t brown_out_reg = READ_PERI_REG(RTC_CNTL_BROWN_OUT_REG);
+  esp_sleep_wakeup_cause_t wakeup = esp_sleep_get_wakeup_cause();
+  snprintf(buf, sizeof(buf),
+           "brown_out_reg=0x%08lX | wakeup_cause=%d | free_heap=%lu",
+           (unsigned long)brown_out_reg, (int)wakeup,
+           (unsigned long)esp_get_free_heap_size());
+  debug_log_event(buf);
+
   // Log if brownout was likely (rtc_reason 15 = RTCWDT_BROWN_OUT_RESET)
   if (rtc_reason == 15) {
     debug_log_event("WARNING: Brownout reset detected (rtc_reason=15)");
