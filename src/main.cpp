@@ -175,6 +175,19 @@ bool connect_wifi() {
     Serial.println(WiFi.localIP());
     debug_log_connect_success(WiFi.localIP().toString().c_str(), WiFi.RSSI());
     consecutiveWifiFailures = 0;
+
+    // Sync real-time clock via NTP so log timestamps are meaningful
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 5000)) {  // 5s timeout
+      char timebuf[64];
+      strftime(timebuf, sizeof(timebuf), "NTP time: %Y-%m-%d %H:%M:%S UTC",
+               &timeinfo);
+      debug_log_event(timebuf);
+    } else {
+      debug_log_event("NTP sync failed (5s timeout)");
+    }
+
     return true;
   } else {
     Serial.printf("\nWiFi connection failed! status=%d\n", WiFi.status());
@@ -392,6 +405,14 @@ void loop() {
     cmd += '\n';  // Ensure newline is included for exact match
     if (cmd == "GETLOG\n") {
       debug_log_dump_to_stream(Serial1);
+    } else if (cmd.startsWith("PLOG:")) {
+      // Remote log line from the Pico — store in persistent log
+      String pico_msg = cmd.substring(5);
+      pico_msg.replace("\n", "");
+      pico_msg.trim();
+      if (pico_msg.length() > 0) {
+        debug_log_event("[PICO]", pico_msg.c_str());
+      }
     } else if (cmd == "SENDIMG\n") {
       // Drain any additional queued SENDIMG commands to avoid processing
       // stale requests that piled up while WiFi was down.
