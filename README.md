@@ -74,32 +74,40 @@ The ESP32 shares a power rail with the RP2040 and the 7.3" e-paper panel. The pa
 - **WiFi auto-reboot** — after 3 consecutive WiFi connection failures, the ESP32 reboots itself (`ESP.restart()`) to recover from stuck radio states.
 - **Stale command drain** — queued SENDIMG commands are drained from the UART buffer before processing, preventing a backlog from blocking the main loop.
 - **Explicit HTTPS client** — uses `WiFiClientSecure` (with `setInsecure()`) for proper TLS handling of the cloud function endpoint.
+- **NTP time sync** — after WiFi connects, time is synced via `pool.ntp.org` so all subsequent log entries use real wall-clock timestamps instead of `boot=N +Xms`.
+
+## Cross-Board Logging (PLOG)
+
+The Pico sends diagnostic log lines prefixed with `PLOG:` over UART. The ESP32 recognizes these and stores them in the persistent SPIFFS log with a `[PICO]` prefix. This gives full visibility into the Pico's behavior (display updates, duplicate skips, timeouts) without needing a separate USB connection to the Pico.
+
+Example log output:
+```
+[2026-04-12 22:30:00] [PICO] | DISPLAY chk=12345 bytes=192000
+[2026-04-12 22:30:28] [PICO] | DISPLAY_DONE
+[2026-04-12 22:30:33] [PICO] | EPD_SLEEP last_sum=0
+[2026-04-12 22:30:33] SENDIMG command received | source=Serial1
+[2026-04-12 22:30:35] NTP time: 2026-04-12 22:30:35 UTC
+```
+
+Pico log events: `BOOT`, `EPD_INIT`, `DISPLAY`, `DISPLAY_DONE`, `EPD_SLEEP`, `SKIP`, `RECV_TIMEOUT`, `RECV_FAIL`.
 
 ## Export Stored Logs To Host File
 
-Use the script in this repo to dump stored logs into the local `logs/` folder with a timestamped filename.
+Use the scripts in this repo to dump stored logs into the local `logs/` folder with a timestamped filename.
 
-1. Install dependency:
+### Quick: download and clear in one step
 
-  ```sh
-  python3 -m pip install pyserial
-  ```
+```sh
+python3 fetch_and_clear_logs.py
+```
 
-1. Run export script:
+This downloads the log, saves it to `logs/esp32-debug-YYYYMMDD-HHMMSS.log`, and clears the ESP32's persistent log. Use `--no-clear` to download without clearing.
 
-  ```sh
-  python3 export_esp32_logs.py
-  ```
+### Download only (legacy script)
 
-1. Optional: choose serial port manually:
-
-  ```sh
-  python3 export_esp32_logs.py --port /dev/cu.usbserial-0001
-  ```
-
-Output file example:
-
-- `logs/esp32-debug-20260329-093000.log`
+```sh
+python3 export_esp32_logs.py
+```
 
 ## WiFi Credentials Setup
 
