@@ -177,11 +177,12 @@ bool connect_wifi() {
     consecutiveWifiFailures = 0;
 
     // Sync real-time clock via NTP so log timestamps are meaningful
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    // Oslo timezone: CET (UTC+1) with CEST (UTC+2) daylight saving
+    configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 5000)) {  // 5s timeout
       char timebuf[64];
-      strftime(timebuf, sizeof(timebuf), "NTP time: %Y-%m-%d %H:%M:%S UTC",
+      strftime(timebuf, sizeof(timebuf), "NTP time: %Y-%m-%d %H:%M:%S Oslo",
                &timeinfo);
       debug_log_event(timebuf);
     } else {
@@ -381,6 +382,8 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
 }
 
 unsigned long lastStatusLog = 0;
+unsigned long lastIdleHeartbeat = 0;
+static const unsigned long IDLE_HEARTBEAT_INTERVAL_MS = 300000;  // 5 minutes
 
 void loop() {
   unsigned long now = millis();
@@ -481,6 +484,16 @@ void loop() {
   if (now - lastStatusLog >= 5000) {
     Serial.println("Waiting for SENDIMG request on Serial1...");
     lastStatusLog = now;
+  }
+  // Persistent heartbeat every 5 minutes so logs show the ESP32 is alive
+  // and listening, even if the Pico never sends SENDIMG.
+  if (now - lastIdleHeartbeat >= IDLE_HEARTBEAT_INTERVAL_MS) {
+    char hb[80];
+    snprintf(hb, sizeof(hb), "IDLE_HEARTBEAT uptime=%lus heap=%u serial1=%d",
+             now / 1000, (unsigned)esp_get_free_heap_size(),
+             Serial1.available());
+    debug_log_event(hb);
+    lastIdleHeartbeat = now;
   }
   blink_slow();
   delay(10);

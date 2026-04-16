@@ -74,7 +74,8 @@ The ESP32 shares a power rail with the RP2040 and the 7.3" e-paper panel. The pa
 - **WiFi auto-reboot** — after 3 consecutive WiFi connection failures, the ESP32 reboots itself (`ESP.restart()`) to recover from stuck radio states.
 - **Stale command drain** — queued SENDIMG commands are drained from the UART buffer before processing, preventing a backlog from blocking the main loop.
 - **Explicit HTTPS client** — uses `WiFiClientSecure` (with `setInsecure()`) for proper TLS handling of the cloud function endpoint.
-- **NTP time sync** — after WiFi connects, time is synced via `pool.ntp.org` so all subsequent log entries use real wall-clock timestamps instead of `boot=N +Xms`.
+- **NTP time sync** — after WiFi connects, time is synced via `pool.ntp.org` using the Europe/Oslo timezone (`CET-1CEST`) so all subsequent log entries use local wall-clock timestamps.
+- **Idle heartbeat** — while waiting for SENDIMG, the ESP32 logs a heartbeat every 5 minutes (`IDLE_HEARTBEAT uptime=Xs heap=Y serial1=Z`) to confirm it is alive and listening.
 
 ## Cross-Board Logging (PLOG)
 
@@ -82,14 +83,18 @@ The Pico sends diagnostic log lines prefixed with `PLOG:` over UART. The ESP32 r
 
 Example log output:
 ```
-[2026-04-12 22:30:00] [PICO] | DISPLAY chk=12345 bytes=192000
-[2026-04-12 22:30:28] [PICO] | DISPLAY_DONE
-[2026-04-12 22:30:33] [PICO] | EPD_SLEEP last_sum=0
-[2026-04-12 22:30:33] SENDIMG command received | source=Serial1
-[2026-04-12 22:30:35] NTP time: 2026-04-12 22:30:35 UTC
+[2026-04-16 21:30:00] [PICO] | DISPLAY chk=12345 bytes=192000 first4=11111111
+[2026-04-16 21:30:00] [PICO] | DISPLAY_DONE ms=31387 forced=0
+[2026-04-16 21:30:00] [PICO] | EPD_PHASES pwr_on=200 refresh=28000 pwr_off=300
+[2026-04-16 21:30:00] [PICO] | REFRESH_VERDICT real=1 refresh_ms=28000
+[2026-04-16 21:30:00] [PICO] | NO_DEEP_SLEEP last_sum=0
+[2026-04-16 21:30:00] SENDIMG command received | source=Serial1
+[2026-04-16 21:30:02] NTP time: 2026-04-16 21:30:02 Oslo
 ```
 
-Pico log events: `BOOT`, `EPD_INIT`, `DISPLAY`, `DISPLAY_DONE`, `EPD_SLEEP`, `SKIP`, `RECV_TIMEOUT`, `RECV_FAIL`.
+Pico log events: `BOOT`, `SENDIMG_START`, `SENDIMG_RESULT`, `EPD_INIT`, `INIT_DONE`, `DISPLAY`, `DISPLAY_DONE`, `EPD_PHASES`, `REFRESH_VERDICT`, `NO_DEEP_SLEEP`, `WAIT_START`, `WAIT_TICK`, `WAIT_DONE`, `SKIP`, `RECV_TIMEOUT`, `RECV_FAIL`.
+
+ESP32 log events: `IDLE_HEARTBEAT`.
 
 ## Export Stored Logs To Host File
 
