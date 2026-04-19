@@ -448,23 +448,14 @@ void loop() {
       bool ok = stream_image_to_uart(IMAGE_URL, Serial1);
       if (ok) {
         Serial.println("Image streamed to RP2040 on Serial1");
-        debug_log_event("Image streamed successfully, sleeping 13min",
+        debug_log_event("Image streamed successfully",
                         "target=Serial1");
-        // Isolate UART GPIOs and shut down peripherals before deep sleep
-        // to prevent parasitic current or EN pin glitches from the Pico's
-        // TX line driving into the sleeping ESP32.
-        Serial1.end();
-        gpio_set_direction((gpio_num_t)SERIAL1_RX_PIN, GPIO_MODE_DISABLE);
-        gpio_set_direction((gpio_num_t)SERIAL1_TX_PIN, GPIO_MODE_DISABLE);
+        // Disconnect WiFi to save power while idle.  Keep UART alive
+        // so we can receive the next SENDIMG without rebooting.
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
-        debug_log_event("Pre-sleep: UART+WiFi off, GPIOs isolated");
-        Serial.flush();
-        // Deep sleep for 13 minutes — the Pico requests a new image every
-        // 15 minutes, so we wake just before the next request arrives.
-        esp_sleep_enable_timer_wakeup(780ULL *
-                                      1000000ULL);  // 780 seconds = 13 min
-        esp_deep_sleep_start();
+        wifiActivated = false;
+        debug_log_event("Post-stream: WiFi off, waiting for next SENDIMG");
       } else {
         Serial.println(
             "ERROR: Image streaming to RP2040 failed. Waiting for next "
