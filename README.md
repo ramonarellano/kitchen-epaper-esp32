@@ -1,150 +1,189 @@
 # Kitchen E-Paper ESP32
 
-This is a PlatformIO project for the NodeMCU-32S (ESP32) board. It implements a UART handshake and image transfer protocol for use with a Raspberry Pi Pico (RP2040) e-paper display controller.
+This is the PlatformIO/Arduino firmware for the NodeMCU-32S (ESP32) board that bridges the cloud renderer and the RP2040 display controller.
 
-## Features Implemented
+## Overview
 
-- **UART Handshake:**
-  - Uses Serial1 (GPIO16=RX, GPIO17=TX) for handshake with the RP2040.
-  - Waits for `HELLO ESP32` from the RP2040, replies with `HELLO RP2040`.
-  - Retries handshake indefinitely until successful.
-  - Debug output to USB serial (Serial) shows all received bytes and handshake status.
+The ESP32 is the **timing master** for the system. It is responsible for:
 
-- **Image download from cloudfunctions.net:**
-  - Uses the cloud application kitchen-epaper-renderer running in Azure
-  - Retrieves a RAW image through a URL, but the URL can be tested in a browser by asking for a PNG:
-  <https://europe-north1-kitche-epaper-renderer.cloudfunctions.net/epaper?format=png>
+- controlling Pico power via GPIO 25 + MOSFET (power cycling between refresh cycles)
+- waiting for `SENDIMG` from the Pico after powering it on
+- turning Wi-Fi on only when needed
+- downloading a raw image from the cloud renderer over HTTPS
+- streaming the image to the Pico as a framed UART payload
+- waiting for `PICODONE` from the Pico to confirm display completion
+- powering off the Pico and waiting 5 minutes before the next cycle
+- storing persistent debug logs in SPIFFS
 
-- **Image Transfer:**
-  - Listens for the command `SENDIMG` on USB serial (Serial).
-  - Responds by sending a hardcoded 800x480 1bpp 2x2 checkerboard pattern image buffer.
-  - LED blinks rapidly during image transfer.
+Current hardware and transport details:
 
-- **LED Status:**
-  - Onboard LED blinks slowly while idle (waiting for commands).
-  - Blinks rapidly during image transfer.
+- Board: NodeMCU-32S
+- Framework: Arduino via PlatformIO
+- `Serial1` pins: GPIO16 RX, GPIO17 TX
+- Pico power pin: GPIO25 (drives N-channel MOSFET gate)
+- UART baud: `115200`
+- Image endpoint: `https://europe-north1-kitche-epaper-renderer.cloudfunctions.net/epaper?format=raw`
 
-- **PlatformIO/Arduino Best Practices:**
-  - Uses Arduino framework and PlatformIO conventions.
-  - All commands are run directly for reproducibility.
+## Current UART Protocol
 
-## Getting Started
+The ESP32 is the power-cycling master. Each cycle:
 
-1. Install [PlatformIO](https://platformio.org/) in VS Code.
-2. Connect your NodeMCU-32S (ESP32) board.
-3. Open this project folder in VS Code.
-4. Build and upload the firmware using the PlatformIO toolbar or the command palette.
+1. ESP32 powers on Pico (GPIO 25 HIGH), waits 3s for boot.
+2. Pico boots, flushes `PLOG:` lines, sends `SENDIMG\n`.
+3. ESP32 connects Wi-Fi, replies with `ACK\n` twice.
+4. ESP32 streams: SOF `0xAA 0x55 0xAA 0x55` + 4-byte big-endian size + raw image bytes.
+5. Pico receives image, inits panel, displays, sleeps panel.
+6. Pico flushes final `PLOG:` lines, sends `PICODONE\n`.
+7. ESP32 powers off Pico (GPIO 25 LOW).
+8. ESP32 waits 5 minutes, then repeats.
 
-## File Structure
+Safety: 120s timeout after power-on; if `PICODONE` isn't received, ESP32 forces power off.
 
-- `platformio.ini`: PlatformIO configuration for the ESP32 board.
-- `src/main.cpp`: Main application code (UART handshake, image transfer, LED logic).
+The ESP32 stores Pico `PLOG:` lines with a `[PICO]` prefix in the persistent log.
 
-## Serial Monitor
+## Main Features
 
-- USB Serial (Serial): 115200 baud (for debug and `SENDIMG` command)
-- Serial1 (GPIO16/17): 115200 baud (for handshake with RP2040)
+- Deferred Wi-Fi activation — Wi-Fi is kept off at boot and only activated during image transfer.
+- Power-cycling master — ESP32 controls Pico power via GPIO 25 + MOSFET, guaranteeing a cold start every cycle.
+- Explicit `WiFiClientSecure` with `setInsecure()` for the cloud-function HTTPS endpoint.
+- Persistent SPIFFS logging that survives reboot and power loss.
+- `PICODONE` handshake with 120s safety timeout.
+- Wi-Fi auto-reboot after 3 consecutive failures.
+- USB serial `GETLOG`/`CLEARLOG` commands available during idle wait.
 
-## Persistent Debug Logging (Standalone Overnight)
+## Serial Interfaces
 
-The firmware stores debug events in SPIFFS so logs survive reboot/power cycle.
+- USB `Serial` at `115200`
+  - debug output
+  - `GETLOG`
+  - `CLEARLOG`
+
+- `Serial1` at `115200`
+  - `SENDIMG` from the Pico
+  - framed ACK/SOF/length/payload response back to the Pico
+  - Pico `PLOG:` diagnostic lines
+
+## Persistent Debug Logging
+
+The ESP32 stores debug events in SPIFFS.
 
 - Log file on device: `/debug_log.txt`
 - Boot counter file on device: `/boot_count.txt`
-- Maximum log size: 64KB (oldest entries are trimmed when full)
-- USB commands:
-  - `GETLOG` prints the stored log
-  - `CLEARLOG` deletes the stored log
+- Maximum log size: 64KB, trimmed from the oldest entries when full
 
 Important behavior:
 
-- Logs are appended on boot; they are not cleared automatically when you plug the ESP32 into a computer.
-- SPIFFS mount is configured without auto-format, so a mount failure will not erase logs.
+- Logs are not cleared automatically on boot.
+- Plugging the ESP32 into a computer for log retrieval usually adds a fresh boot entry at the very end of the fetched log.
+- That trailing boot should not, by itself, be treated as evidence of an in-run reset.
 
-## Power Management and Reliability
+## Fetching Logs
 
-The ESP32 shares a power rail with the RP2040 and the 7.3" e-paper panel. The panel refresh draws significant current, which can cause full power-on resets (voltage collapse) on the ESP32. The following mitigations are in place:
+Always fetch ESP32 logs with `fetch_and_clear_logs.py`.
 
-- **Deferred WiFi** — WiFi is kept off (`WiFi.mode(WIFI_OFF)`) at boot and only activated when a `SENDIMG` command is received. This eliminates idle radio power draw (~150mA continuous) during the ~58 minute wait between image requests, preventing TX current spikes from contributing to voltage dips on the shared power rail.
-- **WiFi disconnect on failure** — if image streaming fails, WiFi is explicitly disconnected and the radio is turned off (`WiFi.disconnect(true)` + `WiFi.mode(WIFI_OFF)`) to avoid leaving the radio active during idle wait.
-- **Guarded WiFi maintenance** — background WiFi reconnection (`maintain_wifi_connection()`) is gated by a `wifiActivated` flag so it only runs after an intentional connect, preventing it from re-enabling the radio during the idle wait period.
-- **No deep sleep** — the ESP32 stays awake continuously, listening for SENDIMG on Serial1. After streaming an image, WiFi is disconnected but UART remains active. This eliminates Bug #14 (POWERON resets during deep sleep) and all timing synchronization issues between the ESP32 and Pico. Power draw is higher (~30-40mA idle vs ~10µA in deep sleep) but acceptable for a wall-powered device.
-- **RTC-level reset reason logging** — boot logs include both the IDF reset reason (`esp_reset_reason()`) and the hardware RTC reset reason (`rtc_get_reset_reason()`). This distinguishes true power-on resets (`rtc_reason=1`) from brownout resets (`rtc_reason=15`) and watchdog resets, aiding diagnosis of power rail issues.
-- **Brownout detector** — left enabled (default). Disabling it masks the underlying power issue and risks silent corruption. The includes for toggling it are kept in `main.cpp` for diagnostic use. To disable temporarily, add `WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);` at the top of `setup()`.
-- **WiFi auto-reboot** — after 3 consecutive WiFi connection failures, the ESP32 reboots itself (`ESP.restart()`) to recover from stuck radio states.
-- **Stale command drain** — queued SENDIMG commands are drained from the UART buffer before processing, preventing a backlog from blocking the main loop.
-- **Explicit HTTPS client** — uses `WiFiClientSecure` (with `setInsecure()`) for proper TLS handling of the cloud function endpoint.
-- **NTP time sync** — after WiFi connects, time is synced via `pool.ntp.org` using the Europe/Oslo timezone (`CET-1CEST`) so all subsequent log entries use local wall-clock timestamps.
-- **Idle heartbeat** — while waiting for SENDIMG, the ESP32 logs a heartbeat every 5 minutes (`IDLE_HEARTBEAT uptime=Xs heap=Y serial1=Z`) to confirm it is alive and listening.
-
-## Cross-Board Logging (PLOG)
-
-The Pico sends diagnostic log lines prefixed with `PLOG:` over UART. The ESP32 recognizes these and stores them in the persistent SPIFFS log with a `[PICO]` prefix. This gives full visibility into the Pico's behavior (display updates, duplicate skips, timeouts) without needing a separate USB connection to the Pico.
-
-Example log output:
-```
-[2026-04-16 21:30:00] [PICO] | DISPLAY chk=12345 bytes=192000 first4=11111111
-[2026-04-16 21:30:00] [PICO] | DISPLAY_DONE ms=31387 forced=0
-[2026-04-16 21:30:00] [PICO] | EPD_PHASES pwr_on=200 refresh=28000 pwr_off=300
-[2026-04-16 21:30:00] [PICO] | REFRESH_VERDICT real=1 refresh_ms=28000
-[2026-04-16 21:30:00] [PICO] | NO_DEEP_SLEEP last_sum=0
-[2026-04-16 21:30:00] SENDIMG command received | source=Serial1
-[2026-04-16 21:30:02] NTP time: 2026-04-16 21:30:02 Oslo
-```
-
-Pico log events: `BOOT`, `SENDIMG_START`, `SENDIMG_RESULT`, `EPD_INIT`, `INIT_DONE`, `DISPLAY`, `DISPLAY_DONE`, `EPD_PHASES`, `REFRESH_VERDICT`, `NO_DEEP_SLEEP`, `WAIT_START`, `WAIT_TICK`, `WAIT_DONE`, `SKIP`, `RECV_TIMEOUT`, `RECV_FAIL`.
-
-ESP32 log events: `IDLE_HEARTBEAT`.
-
-## Export Stored Logs To Host File
-
-Use the scripts in this repo to dump stored logs into the local `logs/` folder with a timestamped filename.
-
-### Quick: download and clear in one step
+Fetch and clear:
 
 ```sh
 python3 fetch_and_clear_logs.py
 ```
 
-This downloads the log, saves it to `logs/esp32-debug-YYYYMMDD-HHMMSS.log`, and clears the ESP32's persistent log. Use `--no-clear` to download without clearing.
-
-### Download only (legacy script)
+Fetch without clearing only if you intentionally need a snapshot:
 
 ```sh
-python3 export_esp32_logs.py
+python3 fetch_and_clear_logs.py --no-clear --timeout 60
 ```
 
-## WiFi Credentials Setup
+Local log files are saved to `logs/esp32-debug-YYYYMMDD-HHMMSS.log`.
 
-WiFi credentials are **not hardcoded** in the firmware. Instead, they are loaded at runtime from a `.env` file stored in SPIFFS. This allows you to keep your credentials private and out of version control.
+Do not use ad-hoc serial reads when collecting debugging evidence.
 
-### How to set up WiFi credentials
+## Power Management And Reliability
 
-1. Create a file named `.env` in the `/data` directory (see `.env.example` for the format):
+The ESP32 is the power-cycling master for the whole system.
 
-   ```ini
-   WIFI_SSID=your_wifi_ssid
-   WIFI_PASS=your_wifi_password
-   ```
+- **Pico power control** — GPIO 25 drives an N-channel MOSFET gate. HIGH = Pico on, LOW = Pico off. Starts LOW on boot (Pico off).
+- **Cold start guarantee** — By cutting Pico power between cycles, all panel register decay / analog rail drift issues (Bug #15) are eliminated.
+- **Deferred Wi-Fi** — Wi-Fi is only activated during image transfer and disconnected immediately after.
+- **Wi-Fi auto-reboot** — after 3 consecutive Wi-Fi failures the ESP32 reboots itself with `ESP.restart()`.
+- **Safety timeout** — if `PICODONE` is not received within 120s of power-on, the ESP32 forces Pico power off.
+- **RTC-level reset logging** — boot logs include both the reset reason and the RTC reset reason.
 
-2. Upload the `/data/.env` file to the ESP32's SPIFFS filesystem:
+## Cross-Board Logging (PLOG)
 
-   - Build the SPIFFS image:
+The Pico sends PLOG lines over `Serial1`, and the ESP32 persists them with a `[PICO]` prefix.
 
-     ```sh
-     pio run --target buildfs
-     ```
+Current Pico-side events commonly seen in the stored log include:
 
-   - Upload the SPIFFS image to the device:
+- `BOOT vbus=X fw=POWER_CYCLE_v1`
+- `SENDIMG_START attempt=X`
+- `SENDIMG_RESULT rc=X recv=Y attempt=Z`
+- `FULL_REINIT`
+- `REINIT_DONE`
+- `POWER_ON_PRE`
+- `DISPLAY_DONE`
+- `EPD_PHASES`
+- `EPD_BUSY04`
+- `EPD_BUSY12`
+- `REFRESH_VERDICT`
+- `EPD_SLEEP`
+- `RECV_TIMEOUT`
+- `RECV_FAIL`
 
-     ```sh
-     platformio run --target uploadfs
-     ```
+ESP32-side events:
 
-3. The firmware will automatically read the WiFi credentials from `/data/.env` on boot.
+- `CYCLE_START #N`
+- `PICO_POWER_ON`
+- `SENDIMG command received`
+- `Image streamed successfully`
+- `PICODONE received`
+- `PICO_POWER_OFF`
+- `CYCLE_DONE`
+- `CYCLE_FAIL` (with reason)
+- `IDLE_WAIT Xs until next cycle`
 
-> **Note:** `.env` and `/data/.env` are included in `.gitignore` and will not be committed to version control.
+Example log shape:
 
----
+```text
+[2026-04-23 19:46:31] [PICO] | SENDIMG_RESULT rc=0 recv=192000
+[2026-04-23 19:46:32] [PICO] | POWER_ON_PRE rc=0 busy=1->0 attempt=1
+[2026-04-23 19:46:32] [PICO] | DISPLAY_DONE ms=31207 forced=0 rc=0
+[2026-04-23 19:46:32] [PICO] | EPD_PHASES pwr_on=0 refresh=30610 pwr_off=150
+[2026-04-23 19:46:32] [PICO] | EPD_BUSY04 1->0
+[2026-04-23 19:46:32] SENDIMG command received | source=Serial1
+```
 
-For more details, see the PlatformIO and Arduino documentation.
+## Build And Flash
+
+Firmware:
+
+```sh
+pio run --target upload
+```
+
+SPIFFS filesystem:
+
+```sh
+pio run --target uploadfs
+```
+
+If the board does not already have the `.env` file in SPIFFS, upload the filesystem before relying on Wi-Fi.
+
+## Wi-Fi Credentials Setup
+
+Wi-Fi credentials are loaded from `/data/.env` in SPIFFS rather than being hardcoded in firmware.
+
+Create `data/.env`:
+
+```ini
+WIFI_SSID=your_wifi_ssid
+WIFI_PASS=your_wifi_password
+```
+
+Then upload SPIFFS:
+
+```sh
+pio run --target buildfs
+pio run --target uploadfs
+```
+
+`data/.env` is gitignored and should not be committed.

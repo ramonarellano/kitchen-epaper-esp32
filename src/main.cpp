@@ -19,7 +19,16 @@ static const int LED_GPIO =
     2;  // On most ESP32 boards, GPIO2 is the onboard LED
 static const int SERIAL1_RX_PIN = 16;  // UART RX for Serial1 (RP2040 -> ESP32)
 static const int SERIAL1_TX_PIN = 17;  // UART TX for Serial1 (ESP32 -> RP2040)
+static const int PICO_POWER_PIN = 25;  // GPIO to control Pico power via MOSFET
 static const int UART_BAUD_RATE = 115200;  // Standard UART baud used
+
+// Timing
+static const unsigned long UPDATE_INTERVAL_MS =
+    5UL * 60UL * 1000UL;  // 5 minutes between display update cycles
+static const unsigned long PICO_BOOT_SETTLE_MS =
+    3000;  // Wait for Pico to boot after power-on
+static const unsigned long PICO_DONE_TIMEOUT_MS =
+    120000;  // 120s max for full Pico cycle (transfer + display)
 
 // Image characteristics
 static const uint32_t IMAGE_WIDTH = 800;
@@ -203,24 +212,6 @@ bool connect_wifi() {
   }
 }
 
-void maintain_wifi_connection(unsigned long now) {
-  if (!wifiActivated) {
-    return;  // WiFi intentionally off; don't reconnect during idle wait
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    return;
-  }
-
-  if (now - lastWifiReconnectAttempt < WIFI_RECONNECT_INTERVAL_MS) {
-    return;
-  }
-
-  Serial.println("WiFi disconnected; attempting background reconnect...");
-  debug_log_reconnect_attempt();
-  connect_wifi();
-}
-
 // NOTE: download_image_to_buffer was removed in favour of streaming directly
 // from the HTTP response to the UART to avoid double-buffering large images.
 
@@ -232,14 +223,79 @@ void setup() {
     delay(10);
   }
   pinMode(LED_GPIO, OUTPUT);
+  // Pico power control — start with Pico OFF
+  pinMode(PICO_POWER_PIN, OUTPUT);
+  digitalWrite(PICO_POWER_PIN, LOW);
   // Initialize Serial1 for RP2040 UART
   Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, SERIAL1_RX_PIN, SERIAL1_TX_PIN);
-  Serial.println("ESP32 ready for stateless SENDIMG protocol");
+  Serial.println("ESP32 ready — power-cycling master mode");
   debug_log_init();
-  // WiFi is deferred until SENDIMG is received to avoid idle power draw
   WiFi.mode(WIFI_OFF);
-  // Download test image at startup (optional, can be removed if not needed)
-  // download_image_to_buffer("https://drive.google.com/uc?export=download&id=1vwwSW9DbbUZ_H7Q_CaS0rMNKG6HDWAHh");
+}
+
+// -------------- Pico power helpers -------------- //
+
+void pico_power_on() {
+  Serial.println("Powering ON Pico");
+  debug_log_event("PICO_POWER_ON");
+  digitalWrite(PICO_POWER_PIN, HIGH);
+}
+
+void pico_power_off() {
+  Serial.println("Powering OFF Pico");
+  debug_log_event("PICO_POWER_OFF");
+  digitalWrite(PICO_POWER_PIN, LOW);
+}
+
+// Drain and store any PLOG lines from the Pico on Serial1.
+// Returns true if a SENDIMG command was seen.
+bool drain_pico_lines(bool store_plogs) {
+  bool saw_sendimg = false;
+  while (Serial1.available()) {
+    String line = Serial1.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    if (line.startsWith("PLOG:") && store_plogs) {
+      String msg = line.substring(5);
+      msg.trim();
+      if (msg.length() > 0) {
+        debug_log_event("[PICO]", msg.c_str());
+      }
+    } else if (line == "SENDIMG") {
+      saw_sendimg = true;
+    } else if (line == "PICODONE") {
+      // handled by caller
+    } else {
+      Serial.printf("Pico line: %s\n", line.c_str());
+    }
+  }
+  return saw_sendimg;
+}
+
+// Wait for a specific command from the Pico, while storing PLOG lines.
+// Returns true if the command was received, false on timeout.
+bool wait_for_pico_command(const char* cmd, unsigned long timeout_ms) {
+  unsigned long start = millis();
+  while (millis() - start < timeout_ms) {
+    if (Serial1.available()) {
+      String line = Serial1.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) continue;
+      if (line.startsWith("PLOG:")) {
+        String msg = line.substring(5);
+        msg.trim();
+        if (msg.length() > 0) {
+          debug_log_event("[PICO]", msg.c_str());
+        }
+      } else if (line == cmd) {
+        return true;
+      } else {
+        Serial.printf("Pico line (waiting for %s): %s\n", cmd, line.c_str());
+      }
+    }
+    delay(10);
+  }
+  return false;
 }
 
 void blink_slow() {
@@ -382,13 +438,12 @@ bool stream_image_to_uart(const char* url, HardwareSerial& port) {
 }
 
 unsigned long lastStatusLog = 0;
-unsigned long lastIdleHeartbeat = 0;
-static const unsigned long IDLE_HEARTBEAT_INTERVAL_MS = 300000;  // 5 minutes
+static unsigned long cycleCount = 0;
 
 void loop() {
   unsigned long now = millis();
-  maintain_wifi_connection(now);
 
+  // Handle USB serial commands (GETLOG/CLEARLOG) while idle
   if (Serial.available()) {
     String usbCmd = Serial.readStringUntil('\n');
     usbCmd.trim();
@@ -402,90 +457,117 @@ void loop() {
     }
   }
 
-  // Listen for image request from RP2040 on Serial1
-  if (Serial1.available()) {
-    String cmd = Serial1.readStringUntil('\n');
-    cmd += '\n';  // Ensure newline is included for exact match
-    if (cmd == "GETLOG\n") {
-      debug_log_dump_to_stream(Serial1);
-    } else if (cmd.startsWith("PLOG:")) {
-      // Remote log line from the Pico — store in persistent log
-      String pico_msg = cmd.substring(5);
-      pico_msg.replace("\n", "");
-      pico_msg.trim();
-      if (pico_msg.length() > 0) {
-        debug_log_event("[PICO]", pico_msg.c_str());
-      }
-    } else if (cmd == "SENDIMG\n") {
-      // Drain any additional queued SENDIMG commands to avoid processing
-      // stale requests that piled up while WiFi was down.
-      delay(50);  // let UART buffer fill with any trailing commands
-      while (Serial1.available()) {
-        String stale = Serial1.readStringUntil('\n');
-        stale.trim();
-        if (stale.length() > 0) {
-          Serial.printf("Drained stale UART command: %s\n", stale.c_str());
-        }
-      }
-      Serial.println("SENDIMG command received on Serial1");
-      debug_log_event("SENDIMG command received", "source=Serial1");
-      wifiActivated = true;
-      if (WiFi.status() != WL_CONNECTED) {
-        Serial.println(
-            "WiFi disconnected; attempting reconnect before image fetch...");
-        if (!connect_wifi()) {
-          Serial.println(
-              "ERROR: WiFi reconnect failed. Waiting for next request.");
-          debug_log_event("SENDIMG aborted", "wifi reconnect failed");
-          return;
-        }
-      }
-      // Send two ACKs to ensure the RP2040 sees the handshake, then pause
-      sendACKs(Serial1);
-      Serial.println("ACKs sent to RP2040");
-      delay(100);       // give the RP2040 time to process the ACKs before SOF
-      blink_fast(600);  // Rapid blink for 600ms while sending
-      bool ok = stream_image_to_uart(IMAGE_URL, Serial1);
-      if (ok) {
-        Serial.println("Image streamed to RP2040 on Serial1");
-        debug_log_event("Image streamed successfully",
-                        "target=Serial1");
-        // Disconnect WiFi to save power while idle.  Keep UART alive
-        // so we can receive the next SENDIMG without rebooting.
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
-        wifiActivated = false;
-        debug_log_event("Post-stream: WiFi off, waiting for next SENDIMG");
-      } else {
-        Serial.println(
-            "ERROR: Image streaming to RP2040 failed. Waiting for next "
-            "request.");
-        debug_log_event("Image streaming failed", "target=Serial1");
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
-        wifiActivated = false;
-      }
+  // ---- Power-cycling master loop ----
+  // 1. Power on the Pico
+  cycleCount++;
+  char cycleBuf[64];
+  snprintf(cycleBuf, sizeof(cycleBuf), "CYCLE_START #%lu", cycleCount);
+  debug_log_event(cycleBuf);
+
+  pico_power_on();
+  delay(PICO_BOOT_SETTLE_MS);  // let Pico boot and flush PLOG
+
+  // 2. Wait for SENDIMG from Pico (it sends PLOG lines first, then SENDIMG)
+  Serial.println("Waiting for SENDIMG from Pico...");
+  bool got_sendimg = wait_for_pico_command("SENDIMG", 30000);  // 30s timeout
+  if (!got_sendimg) {
+    debug_log_event("SENDIMG not received from Pico within 30s");
+    Serial.println("ERROR: No SENDIMG from Pico — powering off");
+    pico_power_off();
+    debug_log_event("CYCLE_FAIL", "no SENDIMG");
+    goto idle_wait;
+  }
+
+  debug_log_event("SENDIMG command received", "source=Serial1");
+  Serial.println("SENDIMG received — connecting WiFi and fetching image");
+
+  // 3. Connect WiFi and stream image
+  {
+    wifiActivated = true;
+    if (!connect_wifi()) {
+      Serial.println("ERROR: WiFi connect failed");
+      debug_log_event("SENDIMG aborted", "wifi connect failed");
+      // Send a minimal response so Pico doesn't hang forever
+      pico_power_off();
+      wifiActivated = false;
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      debug_log_event("CYCLE_FAIL", "wifi");
+      goto idle_wait;
+    }
+
+    sendACKs(Serial1);
+    Serial.println("ACKs sent to Pico");
+    delay(100);
+    blink_fast(600);
+
+    bool ok = stream_image_to_uart(IMAGE_URL, Serial1);
+    // Disconnect WiFi immediately after transfer
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    wifiActivated = false;
+
+    if (ok) {
+      Serial.println("Image streamed to Pico");
+      debug_log_event("Image streamed successfully", "target=Serial1");
     } else {
-      Serial.printf("Unknown command: %s", cmd.c_str());
-      String details = String("raw=") + cmd;
-      debug_log_event("Unknown Serial1 command", details.c_str());
+      Serial.println("ERROR: Image streaming failed");
+      debug_log_event("Image streaming failed", "target=Serial1");
+      pico_power_off();
+      debug_log_event("CYCLE_FAIL", "stream");
+      goto idle_wait;
     }
   }
-  // Status log every 5 seconds
-  if (now - lastStatusLog >= 5000) {
-    Serial.println("Waiting for SENDIMG request on Serial1...");
-    lastStatusLog = now;
+
+  // 4. Wait for PICODONE (Pico has displayed image and parked the panel)
+  Serial.println("Waiting for PICODONE from Pico...");
+  {
+    bool got_done = wait_for_pico_command("PICODONE", PICO_DONE_TIMEOUT_MS);
+    if (got_done) {
+      debug_log_event("PICODONE received — cycle complete");
+      Serial.println("PICODONE received");
+    } else {
+      debug_log_event("PICODONE timeout — forcing power off");
+      Serial.println("WARNING: PICODONE not received within timeout");
+    }
   }
-  // Persistent heartbeat every 5 minutes so logs show the ESP32 is alive
-  // and listening, even if the Pico never sends SENDIMG.
-  if (now - lastIdleHeartbeat >= IDLE_HEARTBEAT_INTERVAL_MS) {
+
+  // 5. Power off the Pico
+  pico_power_off();
+  debug_log_event("CYCLE_DONE");
+
+idle_wait:
+  // 6. Wait for the next cycle
+  {
     char hb[80];
-    snprintf(hb, sizeof(hb), "IDLE_HEARTBEAT uptime=%lus heap=%u serial1=%d",
-             now / 1000, (unsigned)esp_get_free_heap_size(),
-             Serial1.available());
+    snprintf(hb, sizeof(hb), "IDLE_WAIT %lus until next cycle",
+             UPDATE_INTERVAL_MS / 1000);
     debug_log_event(hb);
-    lastIdleHeartbeat = now;
+    Serial.printf("Waiting %lu seconds until next cycle...\n",
+                  UPDATE_INTERVAL_MS / 1000);
+
+    unsigned long waitStart = millis();
+    while (millis() - waitStart < UPDATE_INTERVAL_MS) {
+      // Handle USB serial commands during idle
+      if (Serial.available()) {
+        String usbCmd = Serial.readStringUntil('\n');
+        usbCmd.trim();
+        if (usbCmd == "GETLOG") {
+          debug_log_dump_to_serial();
+        } else if (usbCmd == "CLEARLOG") {
+          debug_log_clear();
+          Serial.println("[DEBUG] Persistent log cleared");
+        }
+      }
+      // Periodic status
+      now = millis();
+      if (now - lastStatusLog >= 60000) {
+        unsigned long remaining = UPDATE_INTERVAL_MS - (now - waitStart);
+        Serial.printf("Idle: %lu seconds remaining\n", remaining / 1000);
+        lastStatusLog = now;
+      }
+      blink_slow();
+      delay(10);
+    }
   }
-  blink_slow();
-  delay(10);
 }
