@@ -254,7 +254,8 @@ bool drain_pico_lines(bool store_plogs) {
   while (Serial1.available()) {
     String line = Serial1.readStringUntil('\n');
     line.trim();
-    if (line.length() == 0) continue;
+    if (line.length() == 0)
+      continue;
     if (line.startsWith("PLOG:") && store_plogs) {
       String msg = line.substring(5);
       msg.trim();
@@ -280,7 +281,8 @@ bool wait_for_pico_command(const char* cmd, unsigned long timeout_ms) {
     if (Serial1.available()) {
       String line = Serial1.readStringUntil('\n');
       line.trim();
-      if (line.length() == 0) continue;
+      if (line.length() == 0)
+        continue;
       if (line.startsWith("PLOG:")) {
         String msg = line.substring(5);
         msg.trim();
