@@ -24,7 +24,7 @@ static const int UART_BAUD_RATE = 115200;  // Standard UART baud used
 
 // Timing
 static const unsigned long UPDATE_INTERVAL_MS =
-    5UL * 60UL * 1000UL;  // 5 minutes between display update cycles
+    60UL * 60UL * 1000UL;  // 60 minutes between display update cycles
 static const unsigned long PICO_BOOT_SETTLE_MS =
     3000;  // Wait for Pico to boot after power-on
 static const unsigned long PICO_DONE_TIMEOUT_MS =
